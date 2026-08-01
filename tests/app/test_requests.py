@@ -121,6 +121,17 @@ class TestBasicProperties:
         assert request.server == ("10.0.0.2", 8080)
 
 
+class TestPathParams:
+    def test_defaults_to_empty_dict_when_absent(self):
+        request = Request(make_scope(), make_receive([]))
+        assert request.path_params == {}
+
+    def test_reads_router_populated_value(self):
+        scope = make_scope(path_params={"id": 42})
+        request = Request(scope, make_receive([]))
+        assert request.path_params == {"id": 42}
+
+
 class TestBody:
     async def test_single_chunk_body(self):
         receive = make_receive(

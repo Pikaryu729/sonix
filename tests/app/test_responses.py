@@ -158,3 +158,37 @@ class TestContentLengthAlwaysCorrect:
             for name, value in sent[0]["headers"]
             if name == b"content-length"
         )
+
+
+class TestBodylessStatusCodes:
+    async def test_204_has_no_content_length_or_content_type(self):
+        response = JSONResponse(None, status_code=204)
+        send, sent = make_send()
+        await response(FAKE_SCOPE, fake_receive, send)
+        names = [name for name, _ in sent[0]["headers"]]
+        assert b"content-length" not in names
+        assert b"content-type" not in names
+
+    async def test_304_has_no_content_length_or_content_type(self):
+        response = Response(status_code=304)
+        send, sent = make_send()
+        await response(FAKE_SCOPE, fake_receive, send)
+        names = [name for name, _ in sent[0]["headers"]]
+        assert b"content-length" not in names
+        assert b"content-type" not in names
+
+    async def test_1xx_has_no_content_length_or_content_type(self):
+        response = Response(status_code=103)
+        send, sent = make_send()
+        await response(FAKE_SCOPE, fake_receive, send)
+        names = [name for name, _ in sent[0]["headers"]]
+        assert b"content-length" not in names
+        assert b"content-type" not in names
+
+    async def test_200_is_unaffected(self):
+        response = JSONResponse({"a": 1})
+        send, sent = make_send()
+        await response(FAKE_SCOPE, fake_receive, send)
+        names = [name for name, _ in sent[0]["headers"]]
+        assert b"content-length" in names
+        assert b"content-type" in names

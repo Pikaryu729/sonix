@@ -1,33 +1,43 @@
 import asyncio
 import functools
 
+from sonix.app.applications import Sonix
+from sonix.app.requests import Request
+from sonix.app.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from sonix.server.protocol import HTTPProtocol
-from sonix.types import Receive, Scope, Send
+
+__all__ = [
+    "HTMLResponse",
+    "JSONResponse",
+    "PlainTextResponse",
+    "Request",
+    "Response",
+    "Sonix",
+]
 
 HOST = "127.0.0.1"
 PORT = 8000
 
-_HELLO_BODY = b"Hello, world!"
 
+def _build_demo_app() -> Sonix:
+    app = Sonix()
 
-async def _hello_world_app(scope: Scope, receive: Receive, send: Send) -> None:
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
-                (b"content-length", str(len(_HELLO_BODY)).encode()),
-            ],
-        }
-    )
-    await send({"type": "http.response.body", "body": _HELLO_BODY, "more_body": False})
+    @app.get("/")
+    def hello_world(request: Request) -> dict:
+        return {"message": "Hello, world!"}
+
+    @app.get("/items/{item_id:int}")
+    def get_item(request: Request) -> dict:
+        return {"item_id": request.path_params["item_id"]}
+
+    return app
 
 
 async def _run_server(host: str, port: int) -> None:
     loop = asyncio.get_running_loop()
+    app = _build_demo_app()
     server = await loop.create_server(
-        functools.partial(HTTPProtocol, app=_hello_world_app), host, port
+        functools.partial(HTTPProtocol, app=app), host, port
     )
     async with server:
         print(f"Sonix serving on http://{host}:{port} (Ctrl+C to stop)")

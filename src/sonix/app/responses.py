@@ -17,6 +17,10 @@ from sonix.types import Receive, Scope, Send
 HeaderTypes = dict[str, str] | list[tuple[str, str]] | None
 
 
+def _forbids_body(status_code: int) -> bool:
+    return status_code == 204 or status_code == 304 or 100 <= status_code < 200
+
+
 def _json_default(obj: Any) -> Any:
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return dataclasses.asdict(obj)
@@ -62,6 +66,21 @@ class Response:
                 encoded.append(
                     (name.lower().encode("latin-1"), value.encode("latin-1"))
                 )
+
+        # 1xx/204/304 responses must not carry a body at all (RFC 9110
+        # SS6.4.1 / SS15.3.5) -- Content-Type would be meaningless and
+        # Content-Length is explicitly forbidden, not just optional, on
+        # these. Strip both rather than computing them. protocol.py's
+        # _decide_close then sees no declared length and closes the
+        # connection rather than assuming keep-alive is safe here -- a
+        # conservative but always-correct fallback, not a bug; it just
+        # means these specific responses don't get to reuse the connection.
+        if _forbids_body(self.status_code):
+            return [
+                (name, value)
+                for name, value in encoded
+                if name not in (b"content-type", b"content-length")
+            ]
 
         # Caller-supplied content-type wins over the class/instance
         # media_type default -- explicit beats implicit.
