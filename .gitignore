@@ -11,3 +11,5 @@ wheels/
 
 # Sphinx docs build output
 docs/_build/
+
+.claude/worktrees
