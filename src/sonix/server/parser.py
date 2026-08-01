@@ -1,0 +1,342 @@
+"""Incremental HTTP/1.1 request parser.
+
+Pure and synchronous: no ``asyncio`` import, no I/O. Bytes go in via
+``feed_data``/``feed_eof``, parsed events come out. This module never
+inspects headers to decide framing more than once per rule -- the same
+request must not be parsed two different ways by two different pieces
+of code, which is the classic root cause of request smuggling.
+"""
+
+from __future__ import annotations
+
+import enum
+import re
+from dataclasses import dataclass, field
+
+
+class HTTPParserError(Exception):
+    """Base class for all errors raised by :class:`HTTP11Parser`."""
+
+
+class MalformedRequest(HTTPParserError):
+    """The input is not a syntactically valid HTTP/1.1 request."""
+
+
+class RequestTooLarge(HTTPParserError):
+    """A configured header or body size limit was exceeded."""
+
+
+@dataclass(frozen=True, slots=True)
+class RequestHead:
+    method: str
+    target: str
+    path: str
+    query_string: bytes
+    http_version: str
+    headers: list[tuple[bytes, bytes]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class RequestHeadComplete:
+    head: RequestHead
+
+
+@dataclass(frozen=True, slots=True)
+class BodyChunk:
+    data: bytes
+    more_body: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RequestComplete:
+    pass
+
+
+Event = RequestHeadComplete | BodyChunk | RequestComplete
+
+
+class _State(enum.Enum):
+    START_LINE = enum.auto()
+    HEADERS = enum.auto()
+    BODY = enum.auto()
+
+
+class _ChunkState(enum.Enum):
+    SIZE = enum.auto()
+    DATA = enum.auto()
+    DATA_CRLF = enum.auto()
+    TRAILERS = enum.auto()
+
+
+_TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_HEX_RE = re.compile(rb"^[0-9A-Fa-f]+$")
+_DIGITS_RE = re.compile(rb"^[0-9]+$")
+_VALID_VERSIONS = {b"HTTP/1.0": "1.0", b"HTTP/1.1": "1.1"}
+
+
+class HTTP11Parser:
+    """An incremental HTTP/1.1 request parser for a single connection.
+
+    ``feed_data`` may return events spanning more than one request --
+    pipelined requests concatenated in a single call are fully drained
+    in one pass, with any leftover partial request retained internally
+    for the next call.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_header_size: int = 8 * 1024,
+        max_headers: int = 100,
+        max_body_size: int = 16 * 1024 * 1024,
+    ) -> None:
+        self.max_header_size = max_header_size
+        self.max_headers = max_headers
+        self.max_body_size = max_body_size
+        self._buffer = bytearray()
+        self._state = _State.START_LINE
+        self._reset_for_next_request()
+
+    def feed_data(self, data: bytes) -> list[Event]:
+        self._buffer.extend(data)
+        events: list[Event] = []
+        while True:
+            if self._state is _State.START_LINE:
+                progressed = self._consume_start_line(events)
+            elif self._state is _State.HEADERS:
+                progressed = self._consume_headers(events)
+            elif self._state is _State.BODY:
+                progressed = self._consume_body(events)
+            else:  # pragma: no cover - exhaustive over _State
+                raise AssertionError(f"unreachable parser state: {self._state}")
+            if not progressed:
+                break
+        return events
+
+    def feed_eof(self) -> None:
+        if self._state is not _State.START_LINE or self._buffer:
+            raise MalformedRequest("connection closed with an incomplete request")
+
+    # -- internal state ---------------------------------------------------
+
+    def _reset_for_next_request(self) -> None:
+        self._state = _State.START_LINE
+        self._method: str | None = None
+        self._target: str | None = None
+        self._path: str | None = None
+        self._query_string: bytes | None = None
+        self._http_version: str | None = None
+        self._headers: list[tuple[bytes, bytes]] = []
+        self._headers_size = 0
+        self._header_count = 0
+        self._content_length: int | None = None
+        self._transfer_encoding_seen = False
+        self._chunked = False
+        self._body_remaining = 0
+        self._chunk_state = _ChunkState.SIZE
+        self._chunk_remaining = 0
+        self._body_bytes_total = 0
+
+    def _find_bounded_line(self, limit: int) -> bytes | None:
+        idx = self._buffer.find(b"\r\n")
+        if idx == -1:
+            if len(self._buffer) > limit:
+                raise RequestTooLarge(f"line exceeds {limit}-byte limit")
+            return None
+        if idx > limit:
+            raise RequestTooLarge(f"line exceeds {limit}-byte limit")
+        line = bytes(self._buffer[:idx])
+        del self._buffer[: idx + 2]
+        return line
+
+    # -- start line ---------------------------------------------------------
+
+    def _consume_start_line(self, events: list[Event]) -> bool:
+        line = self._find_bounded_line(self.max_header_size)
+        if line is None:
+            return False
+        self._parse_request_line(line)
+        self._state = _State.HEADERS
+        return True
+
+    def _parse_request_line(self, line: bytes) -> None:
+        if not line:
+            raise MalformedRequest("empty request line")
+        if any(b < 0x20 or b == 0x7F for b in line):
+            raise MalformedRequest("control character in request line")
+        parts = line.split(b" ")
+        if len(parts) != 3:
+            raise MalformedRequest(f"malformed request line: {line!r}")
+        method, target, version = parts
+        if not _TOKEN_RE.fullmatch(method):
+            raise MalformedRequest(f"invalid method token: {method!r}")
+        if version not in _VALID_VERSIONS:
+            raise MalformedRequest(f"unsupported HTTP version: {version!r}")
+        if not target:
+            raise MalformedRequest("empty request target")
+        try:
+            target_str = target.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise MalformedRequest("request target is not ASCII") from exc
+        path_str, _, query = target_str.partition("?")
+        self._method = method.decode("ascii")
+        self._target = target_str
+        self._path = path_str
+        self._query_string = query.encode("ascii")
+        self._http_version = _VALID_VERSIONS[version]
+
+    # -- headers --------------------------------------------------------------
+
+    def _consume_headers(self, events: list[Event]) -> bool:
+        line = self._find_bounded_line(self.max_header_size)
+        if line is None:
+            return False
+        if line == b"":
+            self._finish_headers(events)
+            return True
+        self._consume_header_line(line)
+        return True
+
+    def _finish_headers(self, events: list[Event]) -> None:
+        if self._content_length is not None and self._chunked:
+            raise MalformedRequest(
+                "Content-Length and Transfer-Encoding must not both be present"
+            )
+        assert self._method is not None
+        assert self._target is not None
+        assert self._path is not None
+        assert self._query_string is not None
+        assert self._http_version is not None
+        head = RequestHead(
+            method=self._method,
+            target=self._target,
+            path=self._path,
+            query_string=self._query_string,
+            http_version=self._http_version,
+            headers=list(self._headers),
+        )
+        events.append(RequestHeadComplete(head))
+        self._body_remaining = self._content_length or 0
+        self._state = _State.BODY
+
+    def _consume_header_line(self, line: bytes) -> None:
+        if line[:1] in (b" ", b"\t"):
+            raise MalformedRequest("header folding (obs-fold) is not supported")
+        if any((b < 0x20 and b != 0x09) or b == 0x7F for b in line):
+            raise MalformedRequest("control character in header line")
+        name, sep, value = line.partition(b":")
+        if not sep:
+            raise MalformedRequest(f"malformed header line: {line!r}")
+        if not _TOKEN_RE.fullmatch(name):
+            raise MalformedRequest(f"invalid header name: {name!r}")
+        value = value.strip(b" \t")
+        name_lower = name.lower()
+        self._headers.append((name_lower, value))
+        self._headers_size += len(line) + 2
+        if self._headers_size > self.max_header_size:
+            raise RequestTooLarge("cumulative header size exceeds max_header_size")
+        self._header_count += 1
+        if self._header_count > self.max_headers:
+            raise RequestTooLarge("too many headers")
+        if name_lower == b"content-length":
+            self._handle_content_length(value)
+        elif name_lower == b"transfer-encoding":
+            self._handle_transfer_encoding(value)
+
+    def _handle_content_length(self, value: bytes) -> None:
+        if self._content_length is not None:
+            raise MalformedRequest("duplicate Content-Length header")
+        if not _DIGITS_RE.fullmatch(value):
+            raise MalformedRequest(f"invalid Content-Length value: {value!r}")
+        length = int(value)
+        if length > self.max_body_size:
+            raise RequestTooLarge("Content-Length exceeds max_body_size")
+        self._content_length = length
+
+    def _handle_transfer_encoding(self, value: bytes) -> None:
+        if self._transfer_encoding_seen:
+            raise MalformedRequest("duplicate Transfer-Encoding header")
+        self._transfer_encoding_seen = True
+        if b"," in value:
+            raise MalformedRequest("Transfer-Encoding must not combine multiple codings")
+        if value.lower() != b"chunked":
+            raise MalformedRequest(f"unsupported Transfer-Encoding value: {value!r}")
+        self._chunked = True
+
+    # -- body -------------------------------------------------------------
+
+    def _consume_body(self, events: list[Event]) -> bool:
+        if self._chunked:
+            return self._consume_chunked_body(events)
+        if self._body_remaining == 0:
+            events.append(BodyChunk(b"", False))
+            events.append(RequestComplete())
+            self._reset_for_next_request()
+            return True
+        if not self._buffer:
+            return False
+        take = min(len(self._buffer), self._body_remaining)
+        chunk = bytes(self._buffer[:take])
+        del self._buffer[:take]
+        self._body_remaining -= take
+        more_body = self._body_remaining > 0
+        events.append(BodyChunk(chunk, more_body))
+        if not more_body:
+            events.append(RequestComplete())
+            self._reset_for_next_request()
+        return True
+
+    def _consume_chunked_body(self, events: list[Event]) -> bool:
+        if self._chunk_state is _ChunkState.SIZE:
+            line = self._find_bounded_line(self.max_header_size)
+            if line is None:
+                return False
+            size_token = line.split(b";", 1)[0].strip()
+            if not size_token or not _HEX_RE.fullmatch(size_token):
+                raise MalformedRequest(f"invalid chunk size: {line!r}")
+            size = int(size_token, 16)
+            if size == 0:
+                self._chunk_state = _ChunkState.TRAILERS
+                return True
+            self._body_bytes_total += size
+            if self._body_bytes_total > self.max_body_size:
+                raise RequestTooLarge("chunked body exceeds max_body_size")
+            self._chunk_remaining = size
+            self._chunk_state = _ChunkState.DATA
+            return True
+
+        if self._chunk_state is _ChunkState.DATA:
+            if not self._buffer:
+                return False
+            take = min(len(self._buffer), self._chunk_remaining)
+            chunk = bytes(self._buffer[:take])
+            del self._buffer[:take]
+            self._chunk_remaining -= take
+            events.append(BodyChunk(chunk, True))
+            if self._chunk_remaining == 0:
+                self._chunk_state = _ChunkState.DATA_CRLF
+            return True
+
+        if self._chunk_state is _ChunkState.DATA_CRLF:
+            if len(self._buffer) < 2:
+                return False
+            if bytes(self._buffer[:2]) != b"\r\n":
+                raise MalformedRequest("malformed chunk terminator")
+            del self._buffer[:2]
+            self._chunk_state = _ChunkState.SIZE
+            return True
+
+        if self._chunk_state is _ChunkState.TRAILERS:
+            line = self._find_bounded_line(self.max_header_size)
+            if line is None:
+                return False
+            if line == b"":
+                events.append(BodyChunk(b"", False))
+                events.append(RequestComplete())
+                self._reset_for_next_request()
+                return True
+            return True  # discard trailer header line
+
+        raise AssertionError(  # pragma: no cover - exhaustive over _ChunkState
+            f"unreachable chunk state: {self._chunk_state}"
+        )
