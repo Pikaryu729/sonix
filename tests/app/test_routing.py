@@ -1,0 +1,274 @@
+import uuid
+
+import pytest
+
+from sonix.app.responses import PlainTextResponse
+from sonix.app.routing import CONVERTERS, RoutePathError, Router, compile_path
+
+
+def make_scope(**overrides):
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"example.com")],
+        "client": ("127.0.0.1", 54321),
+        "server": ("127.0.0.1", 8000),
+    }
+    scope.update(overrides)
+    return scope
+
+
+async def fake_receive():
+    raise AssertionError("handler should never call receive()")
+
+
+def make_send():
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    return send, sent
+
+
+def ok_handler(marker=None, calls=None):
+    async def handler(scope, receive, send):
+        if calls is not None:
+            calls.append(marker)
+        await PlainTextResponse("ok")(scope, receive, send)
+
+    return handler
+
+
+class TestCompilePath:
+    def test_static_template_no_params(self):
+        pattern, converters = compile_path("/items")
+        assert converters == {}
+        assert pattern.fullmatch("/items")
+        assert not pattern.fullmatch("/items/")
+        assert not pattern.fullmatch("/other")
+
+    def test_default_str_converter(self):
+        pattern, converters = compile_path("/items/{name}")
+        assert converters["name"] is CONVERTERS["str"]
+        match = pattern.fullmatch("/items/widget")
+        assert match is not None
+        assert match.group("name") == "widget"
+
+    def test_int_converter_compiles(self):
+        pattern, converters = compile_path("/items/{id:int}")
+        assert converters["id"] is CONVERTERS["int"]
+        assert pattern.fullmatch("/items/42")
+
+    def test_float_converter_compiles(self):
+        pattern, converters = compile_path("/items/{price:float}")
+        assert converters["price"] is CONVERTERS["float"]
+        assert pattern.fullmatch("/items/9.99")
+
+    def test_uuid_converter_compiles(self):
+        pattern, converters = compile_path("/items/{token:uuid}")
+        assert converters["token"] is CONVERTERS["uuid"]
+        assert pattern.fullmatch("/items/12345678-1234-1234-1234-123456789abc")
+
+    def test_path_converter_compiles(self):
+        pattern, converters = compile_path("/static/{rest:path}")
+        assert converters["rest"] is CONVERTERS["path"]
+        assert pattern.fullmatch("/static/js/app.js")
+
+    def test_duplicate_param_name_raises(self):
+        with pytest.raises(RoutePathError):
+            compile_path("/items/{id}/{id}")
+
+    def test_unknown_converter_raises(self):
+        with pytest.raises(RoutePathError):
+            compile_path("/items/{id:bogus}")
+
+    def test_path_converter_not_final_raises(self):
+        with pytest.raises(RoutePathError):
+            compile_path("/files/{rest:path}/extra")
+
+    def test_non_numeric_segment_fails_to_match_not_coerce(self):
+        pattern, _ = compile_path("/items/{id:int}")
+        assert pattern.fullmatch("/items/abc") is None
+
+
+class TestConverters:
+    def test_int_convert(self):
+        assert CONVERTERS["int"].convert("42") == 42
+
+    def test_float_convert(self):
+        assert CONVERTERS["float"].convert("3.5") == 3.5
+
+    def test_uuid_convert(self):
+        value = "12345678-1234-1234-1234-123456789abc"
+        assert CONVERTERS["uuid"].convert(value) == uuid.UUID(value)
+
+    def test_str_convert(self):
+        assert CONVERTERS["str"].convert("x") == "x"
+
+    def test_path_convert(self):
+        assert CONVERTERS["path"].convert("a/b") == "a/b"
+
+
+class TestAddRoute:
+    def test_default_methods_is_get(self):
+        router = Router()
+        router.add_route("/items", ok_handler())
+        assert router._routes[0].methods == ("GET",)
+
+    def test_methods_normalized_to_uppercase(self):
+        router = Router()
+        router.add_route("/items", ok_handler(), methods=["get", "post"])
+        assert router._routes[0].methods == ("GET", "POST")
+
+    def test_duplicate_path_and_method_does_not_raise(self):
+        router = Router()
+        router.add_route("/items", ok_handler())
+        router.add_route("/items", ok_handler())
+        assert len(router._routes) == 2
+
+    def test_explicit_empty_methods_list_raises(self):
+        router = Router()
+        with pytest.raises(ValueError, match="at least one HTTP method"):
+            router.add_route("/items", ok_handler(), methods=[])
+
+
+class TestRouterMatching:
+    async def test_exact_literal_match_dispatches(self):
+        router = Router()
+        router.add_route("/items", ok_handler())
+        send, sent = make_send()
+        await router(make_scope(path="/items"), fake_receive, send)
+        assert sent[0]["status"] == 200
+
+    async def test_int_path_param_coerced(self):
+        calls = []
+        router = Router()
+
+        async def handler(scope, receive, send):
+            calls.append(scope["path_params"])
+            await PlainTextResponse("ok")(scope, receive, send)
+
+        router.add_route("/items/{id:int}", handler)
+        send, _sent = make_send()
+        await router(make_scope(path="/items/42"), fake_receive, send)
+        assert calls == [{"id": 42}]
+        assert isinstance(calls[0]["id"], int)
+
+    async def test_combined_typed_params_coerce(self):
+        calls = []
+
+        async def handler(scope, receive, send):
+            calls.append(scope["path_params"])
+            await PlainTextResponse("ok")(scope, receive, send)
+
+        router = Router()
+        router.add_route("/a/{id:int}/{price:float}/{token:uuid}/{name}", handler)
+        uid = "12345678-1234-1234-1234-123456789abc"
+        send, _sent = make_send()
+        await router(make_scope(path=f"/a/1/2.5/{uid}/bob"), fake_receive, send)
+        assert calls == [
+            {"id": 1, "price": 2.5, "token": uuid.UUID(uid), "name": "bob"}
+        ]
+
+    async def test_trailing_slash_is_strict(self):
+        router = Router()
+        router.add_route("/items", ok_handler())
+        send, sent = make_send()
+        await router(make_scope(path="/items/"), fake_receive, send)
+        assert sent[0]["status"] == 404
+
+    async def test_trailing_slash_is_strict_other_direction(self):
+        router = Router()
+        router.add_route("/items/", ok_handler())
+        send, sent = make_send()
+        await router(make_scope(path="/items"), fake_receive, send)
+        assert sent[0]["status"] == 404
+
+    async def test_registration_order_precedence(self):
+        calls = []
+        router = Router()
+        router.add_route("/items", ok_handler(marker="first", calls=calls))
+        router.add_route("/items", ok_handler(marker="second", calls=calls))
+        send, _sent = make_send()
+        await router(make_scope(path="/items"), fake_receive, send)
+        assert calls == ["first"]
+
+    async def test_path_catch_all_matches_multi_segment_tail(self):
+        calls = []
+
+        async def handler(scope, receive, send):
+            calls.append(scope["path_params"])
+            await PlainTextResponse("ok")(scope, receive, send)
+
+        router = Router()
+        router.add_route("/static/{rest:path}", handler)
+        send, _sent = make_send()
+        await router(make_scope(path="/static/js/app.js"), fake_receive, send)
+        assert calls == [{"rest": "js/app.js"}]
+
+
+class TestNotFound:
+    async def test_no_matching_route_returns_404(self):
+        router = Router()
+        router.add_route("/items", ok_handler())
+        send, sent = make_send()
+        await router(make_scope(path="/nope"), fake_receive, send)
+        assert sent[0]["status"] == 404
+        header_names = [name for name, _ in sent[0]["headers"]]
+        assert b"allow" not in header_names
+
+
+class TestMethodNotAllowed:
+    async def test_single_route_wrong_method(self):
+        router = Router()
+        router.add_route("/items", ok_handler(), methods=["GET"])
+        send, sent = make_send()
+        await router(make_scope(path="/items", method="POST"), fake_receive, send)
+        assert sent[0]["status"] == 405
+        assert (b"allow", b"GET") in sent[0]["headers"]
+
+    async def test_allow_header_is_scan_order_union(self):
+        router = Router()
+        router.add_route("/items", ok_handler(), methods=["GET"])
+        router.add_route("/items", ok_handler(), methods=["POST"])
+        send, sent = make_send()
+        await router(make_scope(path="/items", method="DELETE"), fake_receive, send)
+        assert sent[0]["status"] == 405
+        assert (b"allow", b"GET, POST") in sent[0]["headers"]
+
+    async def test_later_route_with_right_method_is_dispatched_not_405(self):
+        calls = []
+        router = Router()
+        router.add_route(
+            "/items", ok_handler(marker="get-handler", calls=calls), methods=["GET"]
+        )
+        router.add_route(
+            "/items", ok_handler(marker="post-handler", calls=calls), methods=["POST"]
+        )
+        send, sent = make_send()
+        await router(make_scope(path="/items", method="POST"), fake_receive, send)
+        assert sent[0]["status"] == 200
+        assert calls == ["post-handler"]
+
+
+class TestPathParamsInScope:
+    async def test_handler_sees_coerced_path_params_in_scope(self):
+        seen_scopes = []
+
+        async def handler(scope, receive, send):
+            seen_scopes.append(scope)
+            await PlainTextResponse("ok")(scope, receive, send)
+
+        router = Router()
+        router.add_route("/items/{id:int}", handler)
+        send, _sent = make_send()
+        await router(make_scope(path="/items/7"), fake_receive, send)
+        assert seen_scopes[0]["path_params"] == {"id": 7}
