@@ -136,12 +136,8 @@ class TestIncrementalFeeding:
         # not raw event-list equality.
         def summarize(events):
             heads = [e.head for e in events if isinstance(e, RequestHeadComplete)]
-            body = b"".join(
-                e.data for e in events if isinstance(e, BodyChunk)
-            )
-            num_complete = sum(
-                1 for e in events if isinstance(e, RequestComplete)
-            )
+            body = b"".join(e.data for e in events if isinstance(e, BodyChunk))
+            num_complete = sum(1 for e in events if isinstance(e, RequestComplete))
             return heads, body, num_complete
 
         whole = parser()
@@ -359,9 +355,7 @@ class TestSizeLimits:
         header_line = b"X-Foo: " + b"a" * 10  # 17 bytes
         limit = len(header_line) + 2
         p = parser(max_header_size=limit)
-        events = feed(
-            p, b"GET / HTTP/1.1\r\n" + header_line + b"\r\n\r\n"
-        )
+        events = feed(p, b"GET / HTTP/1.1\r\n" + header_line + b"\r\n\r\n")
         assert isinstance(events[0], RequestHeadComplete)
 
     def test_content_length_exactly_at_max_body_size_accepted(self):
@@ -393,9 +387,7 @@ class TestChunkedBody:
             b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n"
             b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n",
         )
-        data = b"".join(
-            e.data for e in events if isinstance(e, BodyChunk) and e.data
-        )
+        data = b"".join(e.data for e in events if isinstance(e, BodyChunk) and e.data)
         assert data == b"foobar"
 
     def test_chunk_extension_ignored(self):
@@ -430,9 +422,7 @@ class TestChunkedBody:
 class TestHeaderEdgeCases:
     def test_header_names_case_insensitive(self):
         p = parser()
-        events = feed(
-            p, b"GET / HTTP/1.1\r\nContent-Type: text/plain\r\n\r\n"
-        )
+        events = feed(p, b"GET / HTTP/1.1\r\nContent-Type: text/plain\r\n\r\n")
         names = [name for name, _ in events[0].head.headers]
         assert b"content-type" in names
         assert b"Content-Type" not in names
@@ -451,9 +441,7 @@ class TestHeaderEdgeCases:
 
     def test_duplicate_non_content_length_headers_preserved(self):
         p = parser()
-        events = feed(
-            p, b"GET / HTTP/1.1\r\nX-Custom: a\r\nX-Custom: b\r\n\r\n"
-        )
+        events = feed(p, b"GET / HTTP/1.1\r\nX-Custom: a\r\nX-Custom: b\r\n\r\n")
         values = [v for name, v in events[0].head.headers if name == b"x-custom"]
         assert values == [b"a", b"b"]
 

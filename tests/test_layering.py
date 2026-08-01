@@ -27,7 +27,9 @@ def test_app_never_imports_server():
     offenders = {}
     for path in APP_DIR.rglob("*.py"):
         modules = _imported_modules(path)
-        server_imports = {m for m in modules if m == "sonix.server" or m.startswith("sonix.server.")}
+        server_imports = {
+            m for m in modules if m == "sonix.server" or m.startswith("sonix.server.")
+        }
         if server_imports:
             offenders[str(path)] = server_imports
     assert not offenders, f"sonix/app/** must never import sonix.server: {offenders}"

@@ -6,7 +6,8 @@ depending on this module never means depending on the other layer.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
+from typing import Any
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]

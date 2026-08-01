@@ -258,7 +258,9 @@ class HTTP11Parser:
             raise MalformedRequest("duplicate Transfer-Encoding header")
         self._transfer_encoding_seen = True
         if b"," in value:
-            raise MalformedRequest("Transfer-Encoding must not combine multiple codings")
+            raise MalformedRequest(
+                "Transfer-Encoding must not combine multiple codings"
+            )
         if value.lower() != b"chunked":
             raise MalformedRequest(f"unsupported Transfer-Encoding value: {value!r}")
         self._chunked = True

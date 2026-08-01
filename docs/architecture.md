@@ -71,8 +71,13 @@ class HTTP11Parser:
     def feed_data(self, data: bytes) -> list[Event]: ...
     def feed_eof(self) -> None: ...
 
+
 class HTTPParserError(Exception): ...
+
+
 class MalformedRequest(HTTPParserError): ...
+
+
 class RequestTooLarge(HTTPParserError): ...
 ```
 
@@ -130,7 +135,7 @@ Concrete HTTP scope:
     "raw_path": b"/items/42",
     "query_string": b"limit=10",
     "root_path": "",
-    "headers": [(b"host", b"example.com"), ...],   # lowercase byte-string tuples
+    "headers": [(b"host", b"example.com"), ...],  # lowercase byte-string tuples
     "client": (host, port),
     "server": (host, port),
 }
@@ -165,8 +170,7 @@ class SomeMiddleware:
     def __init__(self, app, **opts):
         self.app = app
 
-    async def __call__(self, scope, receive, send):
-        ...
+    async def __call__(self, scope, receive, send): ...
 ```
 
 `Sonix` wraps middlewares around the router in reverse registration order, so the first-registered middleware ends up outermost — the same ordering semantics as Starlette.

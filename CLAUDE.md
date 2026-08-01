@@ -34,6 +34,16 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency management and
 - Add a dependency: `uv add <package>`
 - Add a dev dependency: `uv add --dev <package>`
 
+## Code quality
+
+- Formatting: `uv run ruff format .`
+- Linting: `uv run ruff check .` (auto-fix most issues with `uv run ruff check --fix .`)
+- Type checking: `uv run ty check`
+
+`ruff` and `ty` are declared as dev dependencies, so `uv sync` installs them.
+
+**Do not commit if `ruff format --check`, `ruff check`, or `ty check` fail.** Fix the underlying issue rather than working around it. The one exception is a `ty` diagnostic that is actually a false positive (not a real type error) — suppress that specific line with a `# ty: ignore` comment rather than leaving `ty check` failing or restructuring the code to dodge it.
+
 ## Architecture
 
 - Package layout follows the `src/` layout: importable code lives in `src/sonix/`.
