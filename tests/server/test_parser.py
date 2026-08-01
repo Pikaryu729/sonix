@@ -112,6 +112,20 @@ class TestPipelining:
         assert head_events[0].head.method == "POST"
         assert head_events[1].head.path == "/next"
 
+    def test_good_request_then_malformed_request_exposes_partial_events(self):
+        p = parser()
+        data = (
+            b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\n"
+            b"GET/HTTP/1.1\r\nHost: e.com\r\n\r\n"  # missing SPs -> malformed
+        )
+        with pytest.raises(MalformedRequest) as exc_info:
+            feed(p, data)
+        partial_events = exc_info.value.partial_events
+        head_events = [e for e in partial_events if isinstance(e, RequestHeadComplete)]
+        complete_events = [e for e in partial_events if isinstance(e, RequestComplete)]
+        assert [h.head.path for h in head_events] == ["/a"]
+        assert len(complete_events) == 1
+
 
 class TestIncrementalFeeding:
     def test_request_line_split_across_calls(self):

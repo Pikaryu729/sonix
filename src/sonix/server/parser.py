@@ -15,7 +15,19 @@ from dataclasses import dataclass, field
 
 
 class HTTPParserError(Exception):
-    """Base class for all errors raised by :class:`HTTP11Parser`."""
+    """Base class for all errors raised by :class:`HTTP11Parser`.
+
+    ``partial_events`` holds whatever events ``feed_data`` had already
+    accumulated for earlier, fully-parsed pipelined requests before this
+    error was raised, so a caller can still act on them instead of losing
+    them along with the exception.
+    """
+
+    partial_events: list[Event]
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        self.partial_events = []
 
 
 class MalformedRequest(HTTPParserError):
@@ -101,14 +113,18 @@ class HTTP11Parser:
         self._buffer.extend(data)
         events: list[Event] = []
         while True:
-            if self._state is _State.START_LINE:
-                progressed = self._consume_start_line(events)
-            elif self._state is _State.HEADERS:
-                progressed = self._consume_headers(events)
-            elif self._state is _State.BODY:
-                progressed = self._consume_body(events)
-            else:  # pragma: no cover - exhaustive over _State
-                raise AssertionError(f"unreachable parser state: {self._state}")
+            try:
+                if self._state is _State.START_LINE:
+                    progressed = self._consume_start_line(events)
+                elif self._state is _State.HEADERS:
+                    progressed = self._consume_headers(events)
+                elif self._state is _State.BODY:
+                    progressed = self._consume_body(events)
+                else:  # pragma: no cover - exhaustive over _State
+                    raise AssertionError(f"unreachable parser state: {self._state}")
+            except HTTPParserError as exc:
+                exc.partial_events = events
+                raise
             if not progressed:
                 break
         return events
