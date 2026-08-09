@@ -164,6 +164,14 @@ class Request:
     def server(self) -> tuple[str, int] | None:
         return self._scope["server"]
 
+    @property
+    def path_params(self) -> dict[str, Any]:
+        # Written by app/routing.py's Router during matching -- absent
+        # (rather than an empty dict already in scope) until a route with
+        # at least one {param} has matched, so this defaults to {} rather
+        # than a plain __getitem__ lookup.
+        return self._scope.get("path_params", {})
+
     @cached_property
     def headers(self) -> Headers:
         return Headers(self._scope["headers"])

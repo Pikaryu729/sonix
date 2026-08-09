@@ -19,9 +19,20 @@ Scope:
 
 ## Project state
 
-Currently `src/sonix/__init__.py` contains only a placeholder `main()` entry point — none of the framework above is implemented yet. There is no README content, no tests, and no established module layout yet. Treat structural decisions (how routing/middleware/DI/WebSocket modules are organized) as open; don't infer conventions that aren't there.
+`docs/architecture.md` is the reference document for this project: module layout, the design decisions behind each layer, and a 10-step build order. Read it before adding a new subsystem — most structural questions are already answered there, with reasoning.
 
-Note: `pyproject.toml` currently declares `asyncio>=4.0.0` as a dependency. Since `asyncio` is part of the Python 3.14 standard library, this is very likely a leftover/mistaken entry rather than an intentional pin — flag it if touching dependencies, since the stated goal is zero runtime deps.
+Built so far (build-order steps 1–6):
+
+- `types.py` — shared ASGI type aliases.
+- `server/parser.py` — incremental HTTP/1.1 parser: pure and synchronous, chunked bodies, pipelining, and "reject, never resolve" smuggling defenses.
+- `server/protocol.py` — the `asyncio.Protocol` ↔ ASGI bridge: connection lifecycle, keep-alive, pipelined-response ordering, read/write backpressure, slow-loris timeout.
+- `app/requests.py`, `app/responses.py` — `Request`, `Response`/`JSONResponse`/`PlainTextResponse`/`HTMLResponse`.
+- `app/routing.py` — `Router`/`Route`: compiled path templates, param converters, 404 vs. 405.
+- `app/applications.py` — the `Sonix` class and `@app.get`/`@app.post`/etc.
+
+`uv run sonix` serves a working demo app on `127.0.0.1:8000`, so changes to either layer can be exercised end-to-end with `curl`.
+
+Not yet built: `app/middleware.py`, `app/di.py`, `app/exceptions.py`, `server/websockets.py`, `app/websockets.py`, and the final hardening/benchmark pass. Modules that don't exist yet are still open design questions — but follow the shape `docs/architecture.md` sketches for them unless there's a reason not to, and update that document if you deviate.
 
 ## Commands
 
@@ -29,7 +40,7 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency management and
 
 - Install/sync dependencies: `uv sync`
 - Run the CLI entry point: `uv run sonix`
-- Run tests: `uv run pytest` (pytest is declared as a dev dependency in `pyproject.toml`, but no test files exist yet)
+- Run tests: `uv run pytest`
 - Run a single test: `uv run pytest path/to/test_file.py::test_name`
 - Add a dependency: `uv add <package>`
 - Add a dev dependency: `uv add --dev <package>`
@@ -49,3 +60,16 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency management and
 - Package layout follows the `src/` layout: importable code lives in `src/sonix/`.
 - The console script `sonix` (defined in `pyproject.toml` under `[project.scripts]`) maps to `sonix:main`.
 - Build backend is `uv_build` (declared in `[build-system]`).
+
+### The two-layer split (the load-bearing rule)
+
+The framework is deliberately split into two layers, described in full in `docs/architecture.md`:
+
+- **`sonix/server/`** — the "uvicorn" layer. A raw asyncio TCP server plus the hand-rolled HTTP/1.1 parser. Its job ends at the ASGI boundary: bytes on a socket become `(scope, receive, send)` calls into an ASGI application.
+- **`sonix/app/`** — the "Starlette/FastAPI" layer. Routing, middleware, DI, and the request/response objects. **`sonix/app/**` must never import from `sonix.server`** — it depends only on `(scope, receive, send)` and `sonix.types`. `tests/test_layering.py` enforces this mechanically, so a violation shows up as a failing test, not a review comment.
+- **`sonix/types.py`** sits at the top level, sibling to both, holding only the shared ASGI aliases (`Scope`, `Receive`, `Send`, `Message`, `ASGIApp`) and no logic — so depending on the shared contract never means depending on the other layer.
+
+Two further rules that already shape the existing code:
+
+- `server/parser.py` imports no `asyncio` and does no I/O. Framing decisions (`Content-Length` vs. chunked, where a request ends) live there and **only** there — `server/protocol.py` acts on parser events and never re-inspects headers to reach its own framing conclusion. The same request being parsed two different ways by two different pieces of code is the classic request-smuggling root cause.
+- Both layers are testable without a socket: the parser by feeding it bytes, the app layer by handing it a hand-built scope with fake `receive`/`send`. Tests mirror the source layout under `tests/server/` and `tests/app/`.
