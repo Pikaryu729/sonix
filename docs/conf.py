@@ -34,6 +34,11 @@ source_suffix = {
     ".md": "markdown",
 }
 
+# Generate anchors for h1-h3 so in-page links like [build order](#build-order)
+# resolve in the Sphinx build the same way they do when Markdown is read
+# directly on GitHub.
+myst_heading_anchors = 3
+
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
 }

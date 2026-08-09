@@ -7,34 +7,42 @@ Sonix is an async web framework built from scratch on stdlib `asyncio`, with **z
 
 Directory structure enforces this boundary rather than relying only on convention: `sonix/app/**` must never import from `sonix.server`. A dedicated test (`tests/test_layering.py`) checks this mechanically.
 
-This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework will be built. No implementation exists yet — this describes what will be built.
+This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework is built.
+
+**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. `uv run sonix` serves a demo app end-to-end over a real socket. Middleware, dependency injection, exceptions, and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
 
 ## Module layout
 
+Modules marked *(planned)* do not exist yet.
+
 ```
 src/sonix/
-  __init__.py            # public API re-exports: Sonix, Request, Response, JSONResponse,
-                          # PlainTextResponse, HTMLResponse, Depends, WebSocket, HTTPException
-  types.py                # Scope, Receive, Send, ASGIApp type aliases only — no logic.
-                          # Lives at the top level (sibling to server/ and app/) because it's
-                          # the shared ASGI contract both layers reference; putting it inside
-                          # either package would make the other import across the boundary.
+  __init__.py            # public API re-exports + the `sonix` console-script entry point.
+                          # Currently exports Sonix, Request, Response, JSONResponse,
+                          # PlainTextResponse, HTMLResponse; Depends, WebSocket and
+                          # HTTPException join it as their modules land.
+  types.py                # Scope, Message, Receive, Send, ASGIApp type aliases only — no
+                          # logic. Lives at the top level (sibling to server/ and app/)
+                          # because it's the shared ASGI contract both layers reference;
+                          # putting it inside either package would make the other import
+                          # across the boundary.
   server/
     __init__.py
     parser.py             # HTTP/1.1 parser — pure, sync, no asyncio import
     protocol.py           # asyncio.Protocol, connection lifecycle, ASGI bridge, keep-alive
-    websockets.py         # WS handshake (Sec-WebSocket-Accept) + frame codec — bytes-only,
-                          # protocol-level, no ASGI-app concerns
+    websockets.py         # (planned) WS handshake (Sec-WebSocket-Accept) + frame codec —
+                          # bytes-only, protocol-level, no ASGI-app concerns
   app/
     __init__.py
     requests.py           # Request object (scope + receive)
     responses.py          # Response / JSONResponse / PlainTextResponse / HTMLResponse
     routing.py            # Router/Route: path compiling, param coercion, 404/405
-    middleware.py         # ASGI-onion composition + ExceptionMiddleware
-    di.py                 # signature inspection, Depends, resolution plan, per-request caching
-    websockets.py         # WebSocket class built purely from (scope, receive, send)
     applications.py       # Sonix app class: @app.get/@app.websocket, dispatch wiring
-    exceptions.py         # HTTPException and friends
+    middleware.py         # (planned) ASGI-onion composition + ExceptionMiddleware
+    di.py                 # (planned) signature inspection, Depends, resolution plan,
+                          # per-request caching
+    websockets.py         # (planned) WebSocket class built purely from (scope, receive, send)
+    exceptions.py         # (planned) HTTPException and friends
 ```
 
 Tests mirror this 1:1 under `tests/`:
@@ -44,24 +52,25 @@ tests/
   server/
     test_parser.py
     test_protocol.py
-    test_websockets.py
+    test_websockets.py    # (planned)
   app/
     test_requests.py
     test_responses.py
     test_routing.py
-    test_middleware.py
-    test_di.py
-    test_websockets.py
     test_applications.py
-    test_exceptions.py
+    test_middleware.py    # (planned)
+    test_di.py            # (planned)
+    test_websockets.py    # (planned)
+    test_exceptions.py    # (planned)
+  test_types.py           # the shared ASGI contract holds its documented shape
   test_layering.py        # architecture conformance: fails if sonix/app/** imports sonix.server
 ```
 
-**Aside, not addressed by this document:** `pyproject.toml` currently lists `asyncio>=4.0.0` under `[project.dependencies]`. This is a leftover mistake — `asyncio` is part of the Python 3.14 standard library — and should be removed the next time that file is touched, since the project's stated goal is zero runtime dependencies.
+`pyproject.toml` declares `dependencies = []`, and that empty list is a design constraint rather than an oversight: anything appearing there that isn't dev tooling is a bug against the project's premise.
 
 ## Layer 1 — `server/` (the "uvicorn" layer)
 
-### `server/parser.py` — HTTP/1.1 parser
+### `server/parser.py` — HTTP/1.1 parser *(implemented)*
 
 An incremental state-machine parser (`START_LINE → HEADERS → BODY → COMPLETE`), pure and synchronous — it has no `asyncio` import and is unit-testable by feeding it raw bytes with no event loop involved.
 
@@ -94,7 +103,11 @@ Events are small dataclasses: `RequestHeadComplete(head)`, `BodyChunk(data, more
 
 **Pipelining:** a single `feed_data()` call must be able to return events for more than one complete request. Leftover bytes remain in the parser's internal buffer for the next request cycle rather than being discarded — independently testable by feeding two concatenated requests and asserting two `RequestComplete` sequences, with zero event-loop involvement.
 
-### `server/protocol.py` — connection handling and the ASGI bridge
+**Errors carry their partial events.** Pipelining and error handling interact: a `feed_data()` call can complete two perfectly good requests and *then* hit malformed bytes for a third. Raising a bare exception would discard the two good requests along with the bad one, so `HTTPParserError` carries a `partial_events` list holding everything accumulated before the failure. The bridge replays those, then writes its error response — see the turnstile note under `protocol.py`, which is what makes that replay actually reach the client.
+
+**Chunked bodies** are decoded by a nested state machine (`SIZE → DATA → DATA_CRLF → TRAILERS`) sharing the same buffer. Chunk extensions are ignored, trailer headers are discarded, and the accumulated decoded size is checked against `max_body_size` per chunk — so a chunked body can't evade the limit a `Content-Length` body is held to.
+
+### `server/protocol.py` — connection handling and the ASGI bridge *(implemented)*
 
 Built on a raw `asyncio.Protocol`/transport, **not** `asyncio.start_server`/`StreamReader`/`StreamWriter`. Streams wrap `Protocol` anyway and add buffering/locking overhead irrelevant to a `wrk` comparison against a `Protocol`-based uvicorn; more importantly, `Protocol` gives direct access to `transport.pause_reading()`/`resume_reading()` and write-buffer limits, which is what real backpressure and slow-loris defense require. The cost is more hand-rolled state (a manual "feed the parser, react to events" loop instead of `await reader.read()`), which is accepted since making the low-level mechanics legible is the point of the project.
 
@@ -109,7 +122,13 @@ Connection lifecycle:
 
 **Design principle:** `protocol.py` never independently inspects headers to decide how a request body is framed — it only acts on events that `parser.py` emits. This single-source-of-truth rule is what prevents the classic smuggling root cause: the same request being parsed two different ways by two different pieces of code.
 
-### `server/websockets.py` — handshake and frame codec
+Three details that only surfaced once this ran against a real socket, all of them consequences of "one task per in-flight request" meeting "one ordered byte stream":
+
+- **The write turnstile.** Pipelined requests run as concurrent tasks, but HTTP/1.1 requires their responses on the wire in request order. Each request is handed an `asyncio.Event` to wait on before writing its head, and sets a fresh one when its body completes, chaining the in-flight requests into a queue. The error path waits on the same turnstile: a parser failure discovered mid-buffer must not close the transport before the good pipelined responses ahead of it have been written, or they're silently dropped against a closed transport.
+- **Dangling heads are dropped, not dispatched.** A parser error's `partial_events` can end mid-request — a `RequestHeadComplete` with no matching `RequestComplete`, because body framing is exactly what failed. Dispatching that head would spawn a task whose `receive()` can never be satisfied; it would hang forever and, through the turnstile, block every response behind it including the error response. Only events belonging to fully completed requests are replayed.
+- **Cancellation is deferred by one loop iteration.** `connection_lost` puts `http.disconnect` on every live receive queue and then cancels the in-flight tasks — but via `call_soon`, not directly. `put_nowait` only *schedules* the resumption of a task blocked in `queue.get()`; cancelling synchronously races it, and `Task.cancel()` on a task whose awaitable is already done falls back to `_must_cancel`, discarding the disconnect message the app was about to observe.
+
+### `server/websockets.py` — handshake and frame codec *(planned)*
 
 Protocol-level only, no application-facing API:
 
@@ -149,7 +168,13 @@ Sequencing guarantees are enforced defensively at the bridge, not just assumed:
 
 ## Layer 2 — `app/` (the "Starlette/FastAPI" layer)
 
-### `app/routing.py`
+### `app/requests.py` and `app/responses.py` *(implemented)*
+
+`Request` wraps `(scope, receive)`: lazy `Headers` (a case-insensitive read-only view that lowercases both stored keys and lookup keys, so it stays correct against a hand-built scope rather than trusting the parser's normalization), `query_params`, `path_params`, and a streaming `stream()`/`body()`/`json()` trio. A client that disconnects mid-body raises `ClientDisconnect` — deliberately not an `HTTPException`, so `requests.py` stays ignorant of HTTP status codes and a future `ExceptionMiddleware` can map it.
+
+`Response` and its `JSONResponse`/`PlainTextResponse`/`HTMLResponse` subclasses are each ASGI callables in their own right, emitting `http.response.start` then `http.response.body` from `__call__(scope, receive, send)`. That's what lets every other layer finish a request the same way — `await response(scope, receive, send)` — with no special case for who constructed the response.
+
+### `app/routing.py` *(implemented)*
 
 A linear list of compiled route patterns, evaluated in registration order — **not a trie**. A trie wins asymptotically on lookup, but correctly tracking "the path shape matched, but the method didn't" (needed to distinguish 404 from 405) through a trie walk adds real implementation complexity, and at the route counts a project like this will realistically see, the parser/protocol layer — not routing — is where benchmark time is actually spent. This also matches what Starlette/FastAPI themselves do, which keeps a `wrk` comparison focused on the part of Sonix that's actually novel (the hand-rolled server and parser) rather than comparing two different routing data structures.
 
@@ -159,7 +184,7 @@ A linear list of compiled route patterns, evaluated in registration order — **
 - **404 vs. 405:** a full scan is required on every request, since a route can't be ruled out until both its path and method are checked. If no route matches the path shape at all, respond 404. If at least one route matches the path shape but none match the method, respond 405 with an `Allow` header accumulated from every method that *did* match the path.
 - **Path traversal:** routing itself has no filesystem semantics. This is called out explicitly so that any future static-file-serving feature is responsible for resolving against a whitelisted root and rejecting `..`/encoded escapes — it must not be silently assumed to be routing's job.
 
-### `app/middleware.py`
+### `app/middleware.py` *(planned)*
 
 **ASGI-onion wrapping**: each middleware is `middleware(app) -> new_app`, where `new_app.__call__(scope, receive, send)` does pre-work, awaits the inner app (optionally wrapping `receive`/`send` to observe or transform messages), then does post-work. This is deliberately not a before/after hook list — a hook list can't express streaming interception of a response body that arrives as multiple `http.response.body` events, whereas onion wrapping is a single composition model shared with the server bridge and the router, rather than a second one to learn.
 
@@ -179,7 +204,7 @@ The built-in `ExceptionMiddleware` catches `HTTPException` and converts it to a 
 
 Dependency resolution happens *inside route dispatch*, not as a separate middleware layer — it's route- and handler-signature-specific, not a cross-cutting scope-level concern.
 
-### `app/di.py`
+### `app/di.py` *(planned)*
 
 Handler signatures are inspected via `inspect.signature()`/`get_type_hints(include_extras=True)` **once, at route-registration time** — a resolution plan is built once per handler, not re-inspected on every request.
 
@@ -196,7 +221,7 @@ Resolution order per parameter:
 
 **Failure mode:** an unresolvable parameter — no path/query match, no default, no `Depends`, not a recognized special type — raises a `DependencyResolutionError` naming the handler and the parameter **at decoration time** (i.e., when `@app.get(...)` executes), not at request time. This is both cheaper and louder than FastAPI's own deferred-to-request-time behavior. Runtime failures inside a dependency callable itself (e.g. a database connection error) propagate as ordinary exceptions through `ExceptionMiddleware` into a 500 — they are never silently swallowed.
 
-### `app/websockets.py`
+### `app/websockets.py` *(planned)*
 
 A `WebSocket` class built purely from `(scope, receive, send)`:
 
@@ -211,7 +236,9 @@ Because this class only ever touches `scope`/`receive`/`send`, it is fully runti
 
 `@app.websocket("/ws")` reuses `app/routing.py`'s `Router`, matching on path **and** `scope["type"]`, so an HTTP-only route and a WebSocket-only route can share the same path without colliding.
 
-### `app/applications.py` and the public API
+### `app/applications.py` and the public API *(implemented, first pass)*
+
+The description below is the finished target. What exists today is steps 1–4 minus dependency injection: a registered handler takes exactly one argument, a `Request`, and reads path parameters off `request.path_params` — the calling convention Starlette started from before growing signature-based DI on top. `Route` already carries a `di_plan` field, currently always `None`, as the seam where step 7 attaches. Sync-vs-async dispatch, response coercion, and the `Response`-as-ASGI-callable finish are all in place, since none of them depend on DI.
 
 What `@app.get("/items/{id}")` wires up, end to end:
 
@@ -226,15 +253,17 @@ What `@app.get("/items/{id}")` wires up, end to end:
 
 The build order is chosen so that each step is independently testable or demoable, front-loading the highest-risk and most novel code (the parser and the raw `Protocol`-based server) while it's cheapest to isolate, and deferring the well-trodden pieces (routing, DI — which look like every other Python framework) until there's already a working round trip to validate them against.
 
-1. **`types.py`** — shared ASGI type aliases only. Unblocks both layers against a common contract.
-2. **`server/parser.py`** — pure, no `asyncio`. Demo: feed raw bytes and assert the resulting parsed events; feed a `Content-Length`/`Transfer-Encoding` conflict and other malformed input and assert rejection. Build and stress-test this in total isolation before anything depends on it.
-3. **`server/protocol.py`** — wired to a trivial hardcoded ASGI app (a fixed "hello world" response). Demo: `curl` against `uv run sonix`, or a real socket round-trip test. This proves layer 1 end-to-end before layer 2 exists at all.
-4. **`app/requests.py` + `app/responses.py`** — built purely against `types.Scope`/`Receive`/`Send` and tested with a fake scope/receive/send, with `server/` not involved at all. This proves layer 2's runtime-agnosticism starting from the very first module written in it.
-5. **`app/routing.py`** — `Router` as an ASGI app, tested standalone against fake scopes.
-6. **`app/applications.py`** (first pass, no DI or middleware yet) — `Sonix` plus `@app.get`, wired to `server/protocol.py`. This is the first real `curl`-against-a-running-server milestone, and the first point worth taking a `wrk` benchmark checkpoint.
-7. **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch.
-8. **`app/middleware.py`** (with `ExceptionMiddleware`) — onion composition tested against fake inner apps.
-9. **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`.
-10. **Hardening pass** — header/body/backlog size limits, slow-loris timeouts, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code.
+1. ✅ **`types.py`** — shared ASGI type aliases only. Unblocks both layers against a common contract.
+2. ✅ **`server/parser.py`** — pure, no `asyncio`. Demo: feed raw bytes and assert the resulting parsed events; feed a `Content-Length`/`Transfer-Encoding` conflict and other malformed input and assert rejection. Build and stress-test this in total isolation before anything depends on it.
+3. ✅ **`server/protocol.py`** — wired to a trivial hardcoded ASGI app (a fixed "hello world" response). Demo: `curl` against `uv run sonix`, or a real socket round-trip test. This proves layer 1 end-to-end before layer 2 exists at all.
+4. ✅ **`app/requests.py` + `app/responses.py`** — built purely against `types.Scope`/`Receive`/`Send` and tested with a fake scope/receive/send, with `server/` not involved at all. This proves layer 2's runtime-agnosticism starting from the very first module written in it.
+5. ✅ **`app/routing.py`** — `Router` as an ASGI app, tested standalone against fake scopes.
+6. ✅ **`app/applications.py`** (first pass, no DI or middleware yet) — `Sonix` plus `@app.get`, wired to `server/protocol.py`. This is the first real `curl`-against-a-running-server milestone, and the first point worth taking a `wrk` benchmark checkpoint.
+7. ⬜ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch.
+8. ⬜ **`app/middleware.py`** (with `ExceptionMiddleware`) — onion composition tested against fake inner apps.
+9. ⬜ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`.
+10. ⬜ **Hardening pass** — header/body/backlog size limits, slow-loris timeouts, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code.
 
-This yields two concrete demoable milestones along the way — step 3's raw HTTP round trip and step 6's first real `@app.get` — instead of one big-bang integration at the very end.
+This yields two concrete demoable milestones along the way — step 3's raw HTTP round trip and step 6's first real `@app.get` — instead of one big-bang integration at the very end. Both have now landed: `uv run sonix` serves a demo app with `@app.get("/")` and `@app.get("/items/{item_id:int}")` over a real socket.
+
+Note that several step-10 hardening items arrived early, because the protocol layer couldn't be written correctly without them: header/body size limits, the slow-loris head timeout, and read/write backpressure watermarks are already in place. What remains for step 10 is the benchmark and the review passes.
