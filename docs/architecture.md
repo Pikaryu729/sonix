@@ -62,7 +62,7 @@ tests/
     test_di.py            # (planned)
     test_websockets.py    # (planned)
     test_exceptions.py    # (planned)
-  test_types.py           # the shared ASGI contract holds its documented shape
+  test_types.py           # the shared ASGI aliases stay exported under their known names
   test_layering.py        # architecture conformance: fails if sonix/app/** imports sonix.server
 ```
 
@@ -124,7 +124,7 @@ Connection lifecycle:
 
 Three details that only surfaced once this ran against a real socket, all of them consequences of "one task per in-flight request" meeting "one ordered byte stream":
 
-- **The write turnstile.** Pipelined requests run as concurrent tasks, but HTTP/1.1 requires their responses on the wire in request order. Each request is handed an `asyncio.Event` to wait on before writing its head, and sets a fresh one when its body completes, chaining the in-flight requests into a queue. The error path waits on the same turnstile: a parser failure discovered mid-buffer must not close the transport before the good pipelined responses ahead of it have been written, or they're silently dropped against a closed transport.
+- **The write turnstile.** Pipelined requests run as concurrent tasks, but HTTP/1.1 requires their responses on the wire in request order. On dispatch, each request takes the current turnstile event as the one it must await before writing its response head, and installs a fresh event in its place for whichever request comes next — then sets that fresh event once its own body is complete. The result is a chain of events linking the in-flight requests in arrival order. The error path waits on the same turnstile: a parser failure discovered mid-buffer must not close the transport before the good pipelined responses ahead of it have been written, or they're silently dropped against a closed transport.
 - **Dangling heads are dropped, not dispatched.** A parser error's `partial_events` can end mid-request — a `RequestHeadComplete` with no matching `RequestComplete`, because body framing is exactly what failed. Dispatching that head would spawn a task whose `receive()` can never be satisfied; it would hang forever and, through the turnstile, block every response behind it including the error response. Only events belonging to fully completed requests are replayed.
 - **Cancellation is deferred by one loop iteration.** `connection_lost` puts `http.disconnect` on every live receive queue and then cancels the in-flight tasks — but via `call_soon`, not directly. `put_nowait` only *schedules* the resumption of a task blocked in `queue.get()`; cancelling synchronously races it, and `Task.cancel()` on a task whose awaitable is already done falls back to `_must_cancel`, discarding the disconnect message the app was about to observe.
 
@@ -238,7 +238,7 @@ Because this class only ever touches `scope`/`receive`/`send`, it is fully runti
 
 ### `app/applications.py` and the public API *(implemented, first pass)*
 
-The description below is the finished target. What exists today is steps 1–4 minus dependency injection: a registered handler takes exactly one argument, a `Request`, and reads path parameters off `request.path_params` — the calling convention Starlette started from before growing signature-based DI on top. `Route` already carries a `di_plan` field, currently always `None`, as the seam where step 7 attaches. Sync-vs-async dispatch, response coercion, and the `Response`-as-ASGI-callable finish are all in place, since none of them depend on DI.
+The four stages below are the finished target. All four exist today, minus dependency injection: a registered handler takes exactly one argument, a `Request`, and reads path parameters off `request.path_params` — the calling convention Starlette started from before growing signature-based DI on top. `Route` already carries a `di_plan` field, currently always `None`, as the seam where step 7 attaches. Sync-vs-async dispatch, response coercion, and the `Response`-as-ASGI-callable finish are all in place, since none of them depend on DI.
 
 What `@app.get("/items/{id}")` wires up, end to end:
 
