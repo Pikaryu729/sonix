@@ -21,18 +21,26 @@ Scope:
 
 `docs/architecture.md` is the reference document for this project: module layout, the design decisions behind each layer, and a 10-step build order. Read it before adding a new subsystem — most structural questions are already answered there, with reasoning.
 
-Built so far (build-order steps 1–6):
+Built so far (build-order steps 1–8):
 
 - `types.py` — shared ASGI type aliases.
 - `server/parser.py` — incremental HTTP/1.1 parser: pure and synchronous, chunked bodies, pipelining, and "reject, never resolve" smuggling defenses.
 - `server/protocol.py` — the `asyncio.Protocol` ↔ ASGI bridge: connection lifecycle, keep-alive, pipelined-response ordering, read/write backpressure, slow-loris timeout.
+- `server/server.py` — `Config`/`Server`: socket binding, graceful shutdown, signal handling, and the server-side lifespan runner.
 - `app/requests.py`, `app/responses.py` — `Request`, `Response`/`JSONResponse`/`PlainTextResponse`/`HTMLResponse`.
 - `app/routing.py` — `Router`/`Route`: compiled path templates, param converters, 404 vs. 405.
 - `app/applications.py` — the `Sonix` class and `@app.get`/`@app.post`/etc.
+- `app/middleware.py`, `app/exceptions.py` — ASGI-onion composition and `ExceptionMiddleware`, so a raising handler returns a 500 instead of dropping the connection.
+- `app/lifespan.py` — startup/shutdown, and the `scope["state"]` the server copies into each request.
+- `app/di.py` — `Depends`, plans built once at decoration time, query/path coercion, generator dependencies.
 
-`uv run sonix` serves a working demo app on `127.0.0.1:8000`, so changes to either layer can be exercised end-to-end with `curl`.
+Note the build order was **reordered**: middleware and exceptions (originally step 8) landed before DI (originally step 7), because DI's failure modes need somewhere to go. `docs/architecture.md` records this.
 
-Not yet built: `app/middleware.py`, `app/di.py`, `app/exceptions.py`, `server/websockets.py`, `app/websockets.py`, and the final hardening/benchmark pass. Modules that don't exist yet are still open design questions — but follow the shape `docs/architecture.md` sketches for them unless there's a reason not to, and update that document if you deviate.
+`uv run sonix` serves a built-in demo on `127.0.0.1:8000`, and `uv run sonix module:app` serves any app, so changes to either layer can be exercised end-to-end with `curl`.
+
+Not yet built: `server/websockets.py`, `app/websockets.py`, the example application, and the hardening/benchmark pass. Modules that don't exist yet are still open design questions — but follow the shape `docs/architecture.md` sketches for them unless there's a reason not to, and update that document if you deviate.
+
+`tests/conformance/` needs its own dependency group (`uv run --group conformance pytest tests/conformance`); a plain `uv run pytest` skips it.
 
 ## Commands
 

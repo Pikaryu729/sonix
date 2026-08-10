@@ -11,7 +11,7 @@ The boundary is also validated *empirically*, not just structurally. `tests/conf
 
 This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework is built.
 
-**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. Step 7 (middleware and exceptions, swapped ahead of DI — see the [build order](#build-order)) is also done, along with two modules that were not numbered steps at all: a public server API (`Config`, `Server`, `sonix.run`) with a `module:app` CLI, and `app/lifespan.py`. Neither was optional. The server API is a prerequisite for the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo; lifespan fixed a bug that made a Sonix app unable to run under any other ASGI server. `uv run sonix` serves the built-in demo end-to-end over a real socket, and `uvicorn sonix._demo:app` now serves the same app. Dependency injection and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
+**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. Step 7 (middleware and exceptions, swapped ahead of DI — see the [build order](#build-order)) is also done, along with two modules that were not numbered steps at all: a public server API (`Config`, `Server`, `sonix.run`) with a `module:app` CLI, and `app/lifespan.py`. Neither was optional. The server API is a prerequisite for the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo; lifespan fixed a bug that made a Sonix app unable to run under any other ASGI server. `uv run sonix` serves the built-in demo end-to-end over a real socket, and `uvicorn sonix._demo:app` now serves the same app. Step 8 (dependency injection) is done too. WebSockets are designed below but not yet written — that section describes intent, not existing code. Each section marks its own status.
 
 ## Module layout
 
@@ -21,10 +21,9 @@ Modules marked *(planned)* do not exist yet.
 src/sonix/
   __init__.py            # public API re-exports, the `module:app` import-string
                           # resolver, and the `sonix` console-script entry point.
-                          # Currently exports Sonix, Request, Response, JSONResponse,
-                          # PlainTextResponse, HTMLResponse, Config, Server, run;
-                          # Depends, WebSocket and HTTPException join it as their
-                          # modules land.
+                          # Exports Sonix, Request, Response, JSONResponse,
+                          # PlainTextResponse, HTMLResponse, Config, Server, run,
+                          # Depends, HTTPException; WebSocket joins them at step 9.
   _demo.py                # the app `sonix` serves when given no target. Inside the
                           # package rather than under examples/ so a bare `sonix`
                           # works from an installed wheel with nothing on sys.path.
@@ -51,7 +50,7 @@ src/sonix/
     middleware.py         # ASGI-onion composition + ExceptionMiddleware
     lifespan.py           # startup/shutdown: the async-context-manager form, the
                           # on_startup/on_shutdown sugar, and the scope["state"] merge
-    di.py                 # (planned) signature inspection, Depends, resolution plan,
+    di.py                 # signature inspection, Depends, resolution plan,
                           # per-request caching
     websockets.py         # (planned) WebSocket class built purely from (scope, receive, send)
     exceptions.py         # HTTPException and friends
@@ -72,7 +71,7 @@ tests/
     test_applications.py
     test_middleware.py
     test_lifespan.py
-    test_di.py            # (planned)
+    test_di.py
     test_websockets.py    # (planned)
     test_exceptions.py
   test_types.py           # the shared ASGI aliases stay exported under their known names
@@ -300,22 +299,42 @@ Handlers may be registered against an exception class or, for `HTTPException`, a
 
 Dependency resolution happens *inside route dispatch*, not as a separate middleware layer — it's route- and handler-signature-specific, not a cross-cutting scope-level concern.
 
-### `app/di.py` *(planned)*
+### `app/di.py` *(implemented)*
 
 Handler signatures are inspected via `inspect.signature()`/`get_type_hints(include_extras=True)` **once, at route-registration time** — a resolution plan is built once per handler, not re-inspected on every request.
 
-The canonical dependency marker is `Annotated[X, Depends(get_db)]`, with a default-value `= Depends(...)` form documented as a simpler fallback. `Annotated` requires slightly more parsing but keeps default-value slots free for actual parameter defaults, which the classic default-value-only style can't do — worth the extra parsing cost on greenfield 3.14 code.
+The canonical dependency marker is `Annotated[X, Depends(get_db)]`, with a default-value `= Depends(...)` form documented as a simpler fallback. `Annotated` requires slightly more parsing but keeps default-value slots free for actual parameter defaults, which the classic default-value-only style can't do — and, concretely, `value: int = Depends(f)` lies to a type checker about what the default is, which `Annotated` does not.
 
-Resolution order per parameter:
+**Two orderings, and they are not the same thing.** Conflating them was the design's biggest correction.
+
+*Classification precedence*, decided per parameter at decoration time:
 
 1. `Depends(...)` marker — resolved recursively, with sub-dependencies following the same rules.
-2. Path parameters — taken from the dict routing has already coerced.
-3. Query parameters — coerced according to the annotation (`int`/`float`/`bool`/`str`); missing with no default → 422.
-4. Special types — `Request`, `WebSocket`.
+2. Special types — `Request` (`WebSocket` joins it at step 9).
+3. Path parameters — taken from the dict routing has already coerced.
+4. Query parameters — coerced according to the annotation.
 
-**Caching/scoping:** the resolution *plan* is built once per route and cached on the handler. Per-request, a request-scoped cache (keyed by the dependency callable, held on the request/scope) ensures that a `Depends(get_db)` used by two parameters in the same request is invoked only once — mirroring FastAPI's default behavior. An explicit `use_cache=False` opt-out is a nice-to-have, not required for v1.
+*Execution order*, per request: **every scalar in the whole dependency graph is resolved first**, collecting all failures, and the 422 is raised **before any dependency callable runs**. That is what stops a malformed query string from leaving a half-opened database connection behind, and it is why a client sees every mistake in one response instead of one per round trip.
 
-**Failure mode:** an unresolvable parameter — no path/query match, no default, no `Depends`, not a recognized special type — raises a `DependencyResolutionError` naming the handler and the parameter **at decoration time** (i.e., when `@app.get(...)` executes), not at request time. This is both cheaper and louder than FastAPI's own deferred-to-request-time behavior. Runtime failures inside a dependency callable itself (e.g. a database connection error) propagate as ordinary exceptions through `ExceptionMiddleware` into a 500 — they are never silently swallowed.
+**Coercion** covers `str`, `int`, `float`, `bool`, `uuid.UUID`, plus `X | None`, defaults, and `list[X]` over repeated query parameters. `bool` uses an explicit token table (`1/true/t/yes/y/on` and their negatives) rather than Python truthiness, since `bool("false")` is `True`. A valueless `?flag` parses to `""`, which is in neither table and is therefore rejected — the same reject-never-resolve posture the HTTP parser takes.
+
+The coercion table is keyed by *type object* and is deliberately **separate** from `routing.CONVERTERS`, which is keyed by template converter *name*. The conversion callables coincide for the four shared types and a test pins that they cannot drift, but merging the two lookups would mean every new path converter silently became a query-parameter type.
+
+**Path parameters are injected without re-coercion** — routing already converted them. An annotation that disagrees with the template (`/items/{id:int}` with `def h(id: str)`, or `/items/{id}` with `def h(id: int)`) is a **decoration-time error in both directions**. Keeping the template as the single source of truth for path types is what preserves the routing invariant that "the path shape matched but the segment couldn't be coerced" is unreachable.
+
+**Generator dependencies.** A `yield` dependency is wrapped as a context manager on a per-request `contextlib.AsyncExitStack`, which is entered around *sending the response as well as* calling the handler — closing a connection before the rows it produced have been serialized would be a subtle bug. Teardown is LIFO, so a transaction opened inside a connection closes before it. Standard `contextlib` semantics apply and are pinned by a test: cleanup that must run on error needs `try`/`finally`, because a bare `yield` has the exception thrown in at the yield point.
+
+Sync dependency callables run via `asyncio.to_thread`. Sync *generator* dependencies are entered and exited on the event-loop thread instead — splitting the two halves across worker threads would break any resource with thread affinity, and `sqlite3` connections default to `check_same_thread=True`.
+
+**Caching/scoping:** the resolution *plan* is built once per route and closed over by the endpoint. Per-request, a cache keyed by the dependency callable ensures a `Depends(get_db)` used by two parameters is invoked once; `use_cache=False` opts out. The cache is created per request, so nothing leaks between them.
+
+**Where the plan lives — a correction to this document.** Earlier drafts hung the plan off `Route.di_plan`. That field is now **deleted**. By the time a `Route` exists the handler has already been wrapped into an ASGI app closing over its own plan, which is where the signature was known in the first place; honouring a plan inside `Router.__call__` would require routing to build a `Request` and coerce a response, i.e. to absorb the endpoint wrapper and stop being a generic ASGI mounter.
+
+**Fast paths.** The plan precomputes `needs_teardown` and `is_trivial`. Without them every request would allocate an `AsyncExitStack` with nothing to close, and a handler taking only a `Request` — the pre-DI convention, and the shape of the benchmark's own handlers — would pay for machinery it does not use. `is_trivial` dispatches straight through.
+
+**Failure mode:** a parameter with an unsupported annotation and no `Depends`, a variadic or positional-only parameter, an annotation disagreeing with the path template, two `Depends` on one parameter, or a dependency cycle — all raise `DependencyResolutionError` naming the handler and parameter **at decoration time** (when `@app.get(...)` executes), not at request time. Note the failure condition is *unsupported annotation*, not "no query parameter matched": every parameter name is a potential query parameter, so whether one will match is unknowable until a request arrives. Runtime failures inside a dependency callable propagate as ordinary exceptions through `ExceptionMiddleware` into a 500.
+
+**A Python limitation worth knowing.** Under `from __future__ import annotations` (PEP 563) an annotation is a string that `get_type_hints` evaluates against the defining module's globals, so `Annotated[X, Depends(f)]` where `f` is a *local* cannot be resolved — the name lives nowhere the evaluator can see. Module-level dependencies, which is what applications write, are unaffected. Sonix reports this as a `DependencyResolutionError` naming the handler rather than letting a bare `NameError` escape at import time.
 
 ### `app/websockets.py` *(planned)*
 
@@ -334,12 +353,12 @@ Because this class only ever touches `scope`/`receive`/`send`, it is fully runti
 
 ### `app/applications.py` and the public API *(implemented, first pass)*
 
-The four stages below are the finished target. All four exist today, minus dependency injection: a registered handler takes exactly one argument, a `Request`, and reads path parameters off `request.path_params` — the calling convention Starlette started from before growing signature-based DI on top. `Route` already carries a `di_plan` field, currently always `None`, as the seam where step 7 attaches. Sync-vs-async dispatch, response coercion, and the `Response`-as-ASGI-callable finish are all in place, since none of them depend on DI.
+All four stages below exist today. A handler may declare whatever parameters it needs, and the one-argument `def handler(request: Request)` convention that predates DI keeps working as a degenerate plan -- every test written against it passed unedited when DI landed, which is the compatibility guarantee stated as a fact rather than an intention.
 
 What `@app.get("/items/{id}")` wires up, end to end:
 
-1. **Registration.** `Sonix.get(path)` calls `Sonix.route(path, methods=["GET"])`, which compiles the path via `routing.compile_path`, builds a DI plan via `di.build_plan(handler)` (the handler's signature is inspected exactly once, here), and appends a `Route(pattern, converters, methods, handler, di_plan)` to the router. The decorator returns the handler unmodified — registration is its only side effect.
-2. **Dispatch.** At request time, `server/protocol.py` calls `await app(scope, receive, send)` on the fully wrapped middleware onion. Innermost, `Router.__call__` — itself an ASGI app — matches the request, extracts and coerces path parameters, builds a `Request(scope, receive)`, resolves the DI plan (path/query parameters plus recursive `Depends` resolution, with per-request caching), and calls the handler: `await handler(**kwargs)` directly if it's a coroutine function, otherwise run via `asyncio.to_thread` so a synchronous handler never blocks the event loop.
+1. **Registration.** `Sonix.get(path)` calls `Sonix.route(path, methods=["GET"])`, which compiles the path via `routing.compile_path`, builds a DI plan via `di.build_plan(handler)` (the handler's signature is inspected exactly once, here), wraps the handler in an endpoint closing over that plan, and appends a `Route(pattern, converters, methods, handler)` to the router. The decorator returns the handler unmodified — registration is its only side effect.
+2. **Dispatch.** At request time, `server/protocol.py` calls `await app(scope, receive, send)` on the fully wrapped middleware onion. Innermost, `Router.__call__` — itself an ASGI app — matches the request and extracts and coerces path parameters into the scope, then awaits the endpoint. The endpoint builds a `Request(scope, receive)`, resolves its DI plan (path/query parameters plus recursive `Depends` resolution, with per-request caching), and calls the handler: `await handler(**kwargs)` directly if it's a coroutine function, otherwise run via `asyncio.to_thread` so a synchronous handler never blocks the event loop.
 3. **Response construction.** A handler may return a `Response` instance directly, or a plain value (`dict`/`list`/`str`/`None`), which dispatch wraps into a default `JSONResponse` or `PlainTextResponse`. This keeps FastAPI's "just return a dict" ergonomics without pydantic: serialization is a straightforward `json.dumps` over dict/list/dataclass/primitive values. Request-body model validation is explicitly out of scope for this document — at most a future stretch goal built on stdlib `dataclasses`.
 4. **Sending.** `Response` is itself an ASGI callable — `__call__(scope, receive, send)` emits `http.response.start` then `http.response.body` — so dispatch's final step is uniformly `await response(scope, receive, send)`, whether the handler returned a `Response` directly or dispatch constructed one.
 
@@ -356,7 +375,7 @@ The build order is chosen so that each step is independently testable or demoabl
 5. ✅ **`app/routing.py`** — `Router` as an ASGI app, tested standalone against fake scopes.
 6. ✅ **`app/applications.py`** (first pass, no DI or middleware yet) — `Sonix` plus `@app.get`, wired to `server/protocol.py`. This is the first real `curl`-against-a-running-server milestone, and the first point worth taking a `wrk` benchmark checkpoint.
 7. ✅ **`app/middleware.py`** (with `ExceptionMiddleware` and `app/exceptions.py`) — onion composition tested against fake inner apps. **Swapped with DI from this document's original order.** DI's failure modes — a missing query parameter becoming a 422, a dependency callable raising — have nowhere to go without an exception layer, so building DI first would mean building it against a hole. `app/lifespan.py` landed alongside, since both required `Sonix.__call__` to switch on `scope["type"]` rather than delegate blindly.
-8. ⬜ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch.
+8. ✅ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch. Two additions beyond the original design: generator (`yield`) dependencies with an `AsyncExitStack`, without which `Depends(get_db)` is a demo rather than a usable feature; and precomputed fast-path flags on the plan, without which step 10's benchmark would have measured an `AsyncExitStack` allocated per request for handlers that need none.
 9. ⬜ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`.
 10. ⬜ **Hardening pass** — header/body/backlog size limits, slow-loris timeouts, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code.
 
