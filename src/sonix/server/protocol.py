@@ -67,8 +67,9 @@ def build_scope(
     *,
     client: tuple[str, int] | None,
     server: tuple[str, int] | None,
+    state: dict | None = None,
 ) -> Scope:
-    return {
+    scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": head.http_version,
@@ -82,6 +83,15 @@ def build_scope(
         "client": client,
         "server": server,
     }
+    # Per the ASGI spec each request gets a *shallow copy* of the server's
+    # lifespan state: handlers may stash per-request values on it without
+    # leaking them into the next request, while the shared objects the
+    # lifespan opened (a connection, a pool) remain shared. Omitted entirely
+    # when there is no lifespan state, so a scope built without a server is
+    # byte-for-byte what it always was.
+    if state is not None:
+        scope["state"] = dict(state)
+    return scope
 
 
 def _reason_phrase(status: int) -> bytes:
@@ -192,6 +202,7 @@ class HTTPProtocol(asyncio.Protocol):
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
         server_state: ServerState | None = None,
+        state: dict | None = None,
     ) -> None:
         self.app = app
         self._max_header_size = max_header_size
@@ -201,6 +212,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
         self._server_state = server_state
+        self._state = state
         self.transport: asyncio.Transport | None = None
         self.parser: HTTP11Parser | None = None
 
@@ -388,7 +400,9 @@ class HTTPProtocol(asyncio.Protocol):
         self._receive_queues.append(queue)
         self._current_receive_queue = queue
 
-        scope = build_scope(head, client=self._client, server=self._server)
+        scope = build_scope(
+            head, client=self._client, server=self._server, state=self._state
+        )
         receive = self._make_receive(queue)
 
         my_turn = self._write_turnstile

@@ -14,8 +14,10 @@ event loop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import signal
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,11 +28,126 @@ from sonix.server.protocol import (
     HTTPProtocol,
     ServerState,
 )
-from sonix.types import ASGIApp
+from sonix.types import ASGIApp, Message, Scope
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_SHUTDOWN_TIMEOUT = 10.0
+
+
+class LifespanFailure(RuntimeError):
+    """The application reported that startup or shutdown failed."""
+
+
+class LifespanRunner:
+    """Drives the ASGI lifespan protocol on the server side.
+
+    The application's lifespan call is long-lived -- it awaits receive()
+    twice, once for startup and once for shutdown -- so it runs as a task fed
+    by a queue rather than being awaited inline.
+
+    The distinction this class exists to get right is between "this app does
+    not speak lifespan" and "this app's startup genuinely failed". Conflating
+    them is a real bug uvicorn shipped historically, and the consequence is
+    severe in one direction: an app whose database connection fails at startup
+    must crash the server loudly, not be silently downgraded to running
+    without a lifespan. The rule here is that a *protocol message*
+    (lifespan.startup.failed) means a genuine failure and always raises, while
+    an *exception escaping the app* before any message means the app does not
+    implement lifespan at all -- tolerated under "auto", fatal under "on".
+    """
+
+    def __init__(self, app: ASGIApp, *, mode: str = "auto") -> None:
+        if mode not in ("auto", "on", "off"):
+            raise ValueError(f"lifespan must be 'auto', 'on', or 'off', not {mode!r}")
+        self.app = app
+        self.mode = mode
+        self.state: dict[str, Any] = {}
+        self.supported = True
+        self._acknowledged = False
+        self._queue: asyncio.Queue[Message] = asyncio.Queue()
+        self._startup_done = asyncio.Event()
+        self._shutdown_done = asyncio.Event()
+        self._failure: str | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    async def _receive(self) -> Message:
+        return await self._queue.get()
+
+    async def _send(self, message: Message) -> None:
+        message_type = message["type"]
+        if message_type == "lifespan.startup.complete":
+            self._acknowledged = True
+            self._startup_done.set()
+        elif message_type == "lifespan.startup.failed":
+            self._acknowledged = True
+            self._failure = str(message.get("message", ""))
+            self._startup_done.set()
+        elif message_type == "lifespan.shutdown.complete":
+            self._shutdown_done.set()
+        elif message_type == "lifespan.shutdown.failed":
+            self._failure = str(message.get("message", ""))
+            self._shutdown_done.set()
+        else:
+            raise RuntimeError(f"unexpected lifespan message {message_type!r}")
+
+    async def _main(self) -> None:
+        scope: Scope = {
+            "type": "lifespan",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "state": self.state,
+        }
+        try:
+            await self.app(scope, self._receive, self._send)
+        except BaseException:
+            # Escaped without sending anything -- the app does not implement
+            # the lifespan protocol. Note this is only reached when no
+            # lifespan.*.failed message arrived; a genuine failure is reported
+            # through _failure and takes precedence in startup() below.
+            self.supported = False
+            if self.mode == "on":
+                traceback.print_exc()
+        finally:
+            # An app that returned without ever acknowledging startup does not
+            # implement lifespan either -- returning early on an unrecognized
+            # scope type is the polite way to say so, and is more common than
+            # raising. Detecting only the raising case would report such an
+            # app as supported and then hang shutdown waiting for a reply it
+            # is never going to send.
+            if not self._acknowledged:
+                self.supported = False
+            # Unblock anyone waiting, so a non-conforming app cannot hang
+            # startup or shutdown forever.
+            self._startup_done.set()
+            self._shutdown_done.set()
+
+    async def startup(self) -> None:
+        if self.mode == "off":
+            return
+        self._task = asyncio.ensure_future(self._main())
+        self._queue.put_nowait({"type": "lifespan.startup"})
+        await self._startup_done.wait()
+
+        if self._failure is not None:
+            raise LifespanFailure(f"application startup failed:\n{self._failure}")
+        if not self.supported and self.mode == "on":
+            raise LifespanFailure(
+                "lifespan='on' but the application does not support the "
+                "lifespan protocol"
+            )
+
+    async def shutdown(self) -> None:
+        if self.mode == "off" or self._task is None:
+            return
+        if self.supported:
+            self._queue.put_nowait({"type": "lifespan.shutdown"})
+            await self._shutdown_done.wait()
+        if not self._task.done():
+            self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        if self._failure is not None:
+            raise LifespanFailure(f"application shutdown failed:\n{self._failure}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +178,14 @@ class Config:
     # not be able to prevent the process from exiting.
     shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT
 
-    def protocol_factory(self, state: ServerState) -> functools.partial[HTTPProtocol]:
+    # "auto" runs lifespan if the app supports it; "on" requires it; "off"
+    # skips it entirely. See LifespanRunner for why "auto" must not swallow a
+    # genuine startup failure.
+    lifespan: str = "auto"
+
+    def protocol_factory(
+        self, state: ServerState, lifespan_state: dict[str, Any] | None = None
+    ) -> functools.partial[HTTPProtocol]:
         return functools.partial(
             HTTPProtocol,
             self.app,
@@ -72,6 +196,7 @@ class Config:
             body_pause_watermark=self.body_pause_watermark,
             body_resume_watermark=self.body_resume_watermark,
             server_state=state,
+            state=lifespan_state,
         )
 
 
@@ -80,6 +205,7 @@ class Server:
     config: Config
     state: ServerState = field(default_factory=ServerState)
     _server: asyncio.Server | None = field(default=None, init=False)
+    _lifespan: LifespanRunner | None = field(default=None, init=False)
 
     @property
     def sockets(self) -> list:
@@ -89,9 +215,14 @@ class Server:
         return list(self._server.sockets)
 
     async def startup(self) -> None:
+        # Lifespan first, then bind. If startup fails there should never have
+        # been a listening socket for a client to connect to.
+        self._lifespan = LifespanRunner(self.config.app, mode=self.config.lifespan)
+        await self._lifespan.startup()
+
         loop = asyncio.get_running_loop()
         self._server = await loop.create_server(
-            self.config.protocol_factory(self.state),
+            self.config.protocol_factory(self.state, self._lifespan.state),
             self.config.host,
             self.config.port,
             backlog=self.config.backlog,
@@ -142,6 +273,12 @@ class Server:
         if server is not None:
             # Safe now: nothing is left for it to wait on.
             await server.wait_closed()
+
+        # Last, so the application's teardown runs only once no request can
+        # still be using the resources it is about to close.
+        lifespan, self._lifespan = self._lifespan, None
+        if lifespan is not None:
+            await lifespan.shutdown()
 
     async def _drain_busy_connections(self) -> None:
         loop = asyncio.get_running_loop()
