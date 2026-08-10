@@ -1,12 +1,15 @@
 """Sonix: the app class and @app.get/@app.post/... decorators.
 
-First pass, no DI or middleware yet (those are later milestones) -- a
-registered handler always takes exactly one argument, a Request, mirroring
-the calling convention frameworks like Starlette started with before
-adding signature-based dependency injection on top. A sync handler runs
-via asyncio.to_thread so it never blocks the event loop; this part of the
-"await handler(...) directly if async, else asyncio.to_thread" behavior
-is independent of DI and safe to build now.
+No DI yet (that is a later milestone) -- a registered handler always takes
+exactly one argument, a Request, mirroring the calling convention frameworks
+like Starlette started with before adding signature-based dependency
+injection on top. A sync handler runs via asyncio.to_thread so it never
+blocks the event loop; that behavior is independent of DI.
+
+Middleware composition lives in app/middleware.py; this module owns the
+registration lists and decides when the stack gets built -- once, on the
+first request, because it cannot be assembled until every route and
+middleware is registered.
 """
 
 from __future__ import annotations
@@ -16,6 +19,12 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
+from sonix.app.middleware import (
+    ExceptionHandler,
+    HandlerKey,
+    Middleware,
+    build_stack,
+)
 from sonix.app.requests import Request
 from sonix.app.responses import JSONResponse, PlainTextResponse, Response
 from sonix.app.routing import Router
@@ -69,8 +78,57 @@ def _endpoint(handler: Handler) -> ASGIApp:
 
 
 class Sonix:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        middleware: list[Middleware] | None = None,
+        exception_handlers: dict[HandlerKey, ExceptionHandler] | None = None,
+    ) -> None:
         self.router = Router()
+        self.debug = debug
+        self._middleware: list[Middleware] = list(middleware or [])
+        self._exception_handlers: dict[HandlerKey, ExceptionHandler] = dict(
+            exception_handlers or {}
+        )
+        self._stack: ASGIApp | None = None
+
+    # -- middleware and exception handlers -----------------------------------
+
+    def add_middleware(self, cls: Callable[..., ASGIApp], **options: Any) -> None:
+        """Register a middleware class. First registered ends up outermost."""
+        self._assert_not_started("add_middleware")
+        self._middleware.append(Middleware(cls, options))
+
+    def add_exception_handler(self, key: HandlerKey, handler: ExceptionHandler) -> None:
+        self._assert_not_started("add_exception_handler")
+        self._exception_handlers[key] = handler
+
+    def exception_handler(
+        self, key: HandlerKey
+    ) -> Callable[[ExceptionHandler], ExceptionHandler]:
+        def decorator(handler: ExceptionHandler) -> ExceptionHandler:
+            self.add_exception_handler(key, handler)
+            return handler
+
+        return decorator
+
+    def _assert_not_started(self, what: str) -> None:
+        # The stack is built once, on the first request. Mutating the
+        # registration lists afterwards would silently have no effect, which
+        # is worse than refusing.
+        if self._stack is not None:
+            raise RuntimeError(
+                f"{what}() cannot be called after the app has started serving"
+            )
+
+    def build_middleware_stack(self) -> ASGIApp:
+        return build_stack(
+            self.router,
+            self._middleware,
+            handlers=self._exception_handlers,
+            debug=self.debug,
+        )
 
     def route(
         self, path: str, methods: list[str] | None = None
@@ -102,4 +160,15 @@ class Sonix:
         return self.route(path, methods=["DELETE"])
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await self.router(scope, receive, send)
+        scope_type = scope["type"]
+        if scope_type not in ("http", "websocket"):
+            # Previously this method delegated to the router unconditionally,
+            # so a lifespan scope reached Router.__call__ and died on
+            # scope["path"] with a bare KeyError. Lifespan support lands in
+            # app/lifespan.py; until then, fail with something that names the
+            # actual problem.
+            raise RuntimeError(f"unsupported ASGI scope type {scope_type!r}")
+
+        if self._stack is None:
+            self._stack = self.build_middleware_stack()
+        await self._stack(scope, receive, send)
