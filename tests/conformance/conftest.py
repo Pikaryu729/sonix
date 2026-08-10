@@ -31,18 +31,25 @@ def _importable(module: str) -> bool:
     return True
 
 
-_ALL = [
+_HTTPX_MODULES = [
     "test_fastapi_on_sonix.py",
     "test_starlette_on_sonix.py",
     "test_sonix_under_uvicorn.py",
 ]
+_WEBSOCKET_MODULES = [
+    "test_starlette_ws_on_sonix.py",
+    "test_sonix_under_uvicorn.py",
+]
 
 if not _importable("httpx"):
-    collect_ignore.extend(_ALL)
-else:
-    if not _importable("fastapi"):
-        collect_ignore.append("test_fastapi_on_sonix.py")
-    if not _importable("starlette"):
-        collect_ignore.append("test_starlette_on_sonix.py")
-    if not _importable("uvicorn"):
-        collect_ignore.append("test_sonix_under_uvicorn.py")
+    collect_ignore.extend(_HTTPX_MODULES)
+if not _importable("websockets"):
+    collect_ignore.extend(_WEBSOCKET_MODULES)
+if not _importable("fastapi"):
+    collect_ignore.append("test_fastapi_on_sonix.py")
+if not _importable("starlette"):
+    collect_ignore.extend(
+        ["test_starlette_on_sonix.py", "test_starlette_ws_on_sonix.py"]
+    )
+if not _importable("uvicorn"):
+    collect_ignore.append("test_sonix_under_uvicorn.py")

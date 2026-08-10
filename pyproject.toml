@@ -53,6 +53,7 @@ conformance = [
     "pydantic==2.14.0b1",
     "starlette>=1.6.0",
     "uvicorn>=0.52.1",
+    "websockets>=15",
 ]
 dev = [
     "myst-parser>=5.1.0",

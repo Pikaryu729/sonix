@@ -11,6 +11,7 @@ import contextlib
 
 from sonix import JSONResponse, Request, Sonix
 from sonix.app.exceptions import HTTPException
+from sonix.app.websockets import WebSocket
 
 
 @contextlib.asynccontextmanager
@@ -56,3 +57,29 @@ async def teapot(request: Request) -> JSONResponse:
 @app.get("/boom")
 async def boom(request: Request) -> str:
     raise RuntimeError("deliberate failure")
+
+
+@app.websocket("/ws/echo")
+async def ws_echo(websocket: WebSocket) -> None:
+    await websocket.accept()
+    async for message in websocket.iter_text():
+        await websocket.send_text(message)
+
+
+@app.websocket("/ws/rooms/{room:int}")
+async def ws_room(websocket: WebSocket, room: int, token: str = "anon") -> None:
+    # Path and query injection on a websocket route, resolved by exactly the
+    # same plan machinery as an HTTP route.
+    await websocket.accept()
+    await websocket.send_json({"room": room, "token": token})
+
+
+@app.websocket("/ws/deny")
+async def ws_deny(websocket: WebSocket) -> None:
+    await websocket.close(code=1008)
+
+
+@app.websocket("/ws/state")
+async def ws_state(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await websocket.send_json({"greeting": websocket.state["greeting"]})

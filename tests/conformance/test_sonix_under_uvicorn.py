@@ -14,12 +14,14 @@ request could be served.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 
 import httpx
 import pytest
+import websockets
 
 from conformance.support import UVICORN_CMD, free_port, wait_until_serving
 
@@ -142,3 +144,44 @@ def test_uvicorn_module_is_runnable():
     )
     assert result.returncode == 0, result.stderr
     assert sys.executable
+
+
+class TestSonixWebSocketsUnderUvicorn:
+    """The app layer speaking ASGI websockets on somebody else's server.
+
+    Sonix's own bridge is not involved at all here: uvicorn does the
+    handshake and the framing, and a @app.websocket handler runs unchanged.
+    """
+
+    @staticmethod
+    def ws_url(base_url: str, path: str) -> str:
+        return base_url.replace("http://", "ws://", 1) + path
+
+    async def test_echo(self, uvicorn_url):
+        async with websockets.connect(self.ws_url(uvicorn_url, "/ws/echo")) as client:
+            await client.send("hello")
+            assert await asyncio.wait_for(client.recv(), 5) == "hello"
+
+    async def test_path_and_query_injection(self, uvicorn_url):
+        url = self.ws_url(uvicorn_url, "/ws/rooms/7?token=abc")
+        async with websockets.connect(url) as client:
+            payload = await asyncio.wait_for(client.recv(), 5)
+        assert json.loads(payload) == {"room": 7, "token": "abc"}
+
+    async def test_lifespan_state_reaches_a_websocket_handler(self, uvicorn_url):
+        async with websockets.connect(self.ws_url(uvicorn_url, "/ws/state")) as client:
+            payload = await asyncio.wait_for(client.recv(), 5)
+        assert json.loads(payload) == {"greeting": "from lifespan"}
+
+    async def test_close_before_accept_is_refused(self, uvicorn_url):
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            await websockets.connect(self.ws_url(uvicorn_url, "/ws/deny"))
+
+    async def test_unmatched_websocket_path_is_refused(self, uvicorn_url):
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            await websockets.connect(self.ws_url(uvicorn_url, "/ws/nope"))
+
+    async def test_an_http_request_to_a_websocket_path_is_404(self, uvicorn_url):
+        # Not a 405 with an empty Allow header.
+        async with httpx.AsyncClient(base_url=uvicorn_url) as client:
+            assert (await client.get("/ws/echo")).status_code == 404
