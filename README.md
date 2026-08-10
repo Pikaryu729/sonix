@@ -79,9 +79,19 @@ sonix/
 
 The interesting constraint is that **`sonix/app/**` may never import
 `sonix.server`**. That is not a code-review convention; `tests/test_layering.py`
-walks the AST of every module under `app/` and fails if one does. The payoff is
-that a Sonix application is a plain ASGI application — it runs under uvicorn
-just as uvicorn's applications run under Sonix.
+walks the AST of every module under `app/` and fails if one does.
+
+The payoff is checked rather than asserted. CI runs a conformance suite in
+**both directions**:
+
+- **FastAPI and Starlette applications, unmodified, served by Sonix's HTTP
+  server** — including request bodies, streaming responses with no
+  `Content-Length`, background tasks, and a client that disconnects mid-stream.
+- **A Sonix application served by uvicorn**, launched in a subprocess with an
+  import string exactly as a deployment would.
+
+Passing your own unit tests shows the code agrees with itself. Running someone
+else's framework shows it agrees with the spec.
 
 ## Zero dependencies, and why that is checked, not claimed
 
@@ -116,6 +126,16 @@ $ uv run ty check            # type check
 ```
 
 All four run in CI on every push and pull request.
+
+The conformance suite needs FastAPI, Starlette and uvicorn, which live in an
+isolated dependency group so a plain `uv sync` never installs them:
+
+```console
+$ uv run --group conformance pytest tests/conformance
+```
+
+Without that group the directory is skipped rather than failing, so the
+zero-dependency development path stays intact.
 
 ## Benchmarks
 
