@@ -52,6 +52,22 @@ jobs:
       - name: pytest
         run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=90
 
+  conformance:
+    name: Cross-implementation conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked --group conformance
+      # Proves both directions of the two-layer split: FastAPI and Starlette
+      # served by Sonix's HTTP server, and a Sonix app served by uvicorn.
+      # Runs separately from the main test job precisely because that job
+      # must keep passing with zero third-party packages installed.
+      - name: FastAPI / Starlette on Sonix, and Sonix under uvicorn
+        run: uv run --group conformance pytest tests/conformance -v
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

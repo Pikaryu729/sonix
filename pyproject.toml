@@ -40,6 +40,20 @@ requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# Third-party packages are allowed HERE and nowhere else. None of these are
+# imported by sonix itself -- they exist to cross-check it (conformance) and to
+# measure it (bench, added later). They are not in `dev`, so a plain `uv sync`
+# never installs them, and tests/test_packaging.py asserts in CI that none of
+# this leaks into [project].dependencies.
+#
+#   uv sync --group conformance
+conformance = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic==2.14.0b1",
+    "starlette>=1.6.0",
+    "uvicorn>=0.52.1",
+]
 dev = [
     "myst-parser>=5.1.0",
     "pytest>=9.1.1",
