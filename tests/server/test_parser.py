@@ -266,7 +266,8 @@ class TestTransferEncodingSmuggling:
         with pytest.raises(MalformedRequest):
             feed(
                 p,
-                b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: identity\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: e.com\r\n"
+                b"Transfer-Encoding: identity\r\n\r\n",
             )
 
 

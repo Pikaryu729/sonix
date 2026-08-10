@@ -370,7 +370,8 @@ class TestBackpressure:
         )
         content_length = 5
         protocol.data_received(
-            f"POST / HTTP/1.1\r\nHost: e.com\r\nContent-Length: {content_length}\r\n\r\n".encode()
+            f"POST / HTTP/1.1\r\nHost: e.com\r\n"
+            f"Content-Length: {content_length}\r\n\r\n".encode()
         )
         for byte in b"abcde":
             protocol.data_received(bytes([byte]))

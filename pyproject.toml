@@ -1,13 +1,36 @@
 [project]
 name = "sonix"
 version = "0.1.0"
-description = "Add your description here"
+description = "An async web framework built from scratch on asyncio, with zero runtime dependencies."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Ryushin Wells", email = "ryushin.wells@gmail.com" }
 ]
+keywords = ["asgi", "asyncio", "http", "web-framework", "websockets"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 requires-python = ">=3.14"
+
+# Intentionally empty, and enforced by tests/test_packaging.py rather than by
+# convention: Sonix implements its own HTTP/1.1 parser, ASGI server, routing,
+# and WebSocket codec, so anything appearing here is a bug against the premise.
+# Third-party packages used to *measure* or *cross-check* Sonix live in the
+# `bench` and `conformance` dependency-groups below -- never here, never in `dev`.
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Pikaryu729/sonix"
+Repository = "https://github.com/Pikaryu729/sonix"
+Documentation = "https://sonix.readthedocs.io"
 
 [project.scripts]
 sonix = "sonix:main"
@@ -21,6 +44,7 @@ dev = [
     "myst-parser>=5.1.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.0.0",
     "ruff>=0.16.1",
     "sphinx>=9.1.0",
     "sphinx-rtd-theme>=3.1.0",
@@ -30,3 +54,50 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Puts tests/helpers.py on sys.path so every test module can import the shared
+# scope/receive/send factories instead of redefining them.
+pythonpath = ["tests"]
+
+[tool.coverage.run]
+source = ["sonix"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "C4",     # flake8-comprehensions
+    "ASYNC",  # flake8-async -- the one that earns its place in an asyncio project
+    "PT",     # flake8-pytest-style
+    "TRY",    # tryceratops
+    "PERF",   # perflint
+    "RUF",    # ruff-specific
+]
+ignore = [
+    # The parser's whole "reject, never resolve" posture depends on error
+    # messages that say precisely which framing rule was violated. Satisfying
+    # TRY003 would mean ~40 bespoke exception subclasses carrying the same
+    # strings -- strictly worse code in service of the lint.
+    "TRY003",
+    # contextlib.suppress() costs a context-manager enter/exit where
+    # try/except/pass costs nothing on the happy path. Both sites are
+    # per-request or per-connection in a server whose point is throughput.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately raise bare exceptions in fake ASGI apps to prove the
+# framework converts them, and assert on messages inline.
+"tests/**" = ["TRY002", "TRY003", "TRY301", "EM101"]

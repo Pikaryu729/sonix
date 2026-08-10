@@ -2,6 +2,7 @@ import dataclasses
 import json
 
 import pytest
+from helpers import fake_receive, make_send
 
 from sonix.app.responses import (
     HTMLResponse,
@@ -10,21 +11,9 @@ from sonix.app.responses import (
     Response,
 )
 
-
-def make_send():
-    sent: list[dict] = []
-
-    async def send(message):
-        sent.append(message)
-
-    return send, sent
-
-
+# Response.__call__ must not read anything off the scope -- an empty dict is
+# the strongest way to assert that.
 FAKE_SCOPE: dict = {}
-
-
-async def fake_receive():
-    raise AssertionError("Response.__call__ should never call receive()")
 
 
 class TestResponseCall:
