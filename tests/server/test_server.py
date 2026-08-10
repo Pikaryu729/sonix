@@ -99,6 +99,8 @@ class TestConfig:
             ws_resume_watermark=2,
             ws_ping_interval=1.5,
             ws_ping_timeout=0.5,
+            date_header=False,
+            server_header=b"custom",
             upgrade_protocols=frozenset({"h2c"}),
         )
         protocol = config.protocol_factory(Server(config).state)()
@@ -118,6 +120,8 @@ class TestConfig:
         assert protocol._ws_resume_watermark == 2
         assert protocol._ws_ping_interval == 1.5
         assert protocol._ws_ping_timeout == 0.5
+        assert protocol._date_header is False
+        assert protocol._server_header == b"custom"
         assert protocol._upgrade_protocols == frozenset({"h2c"})
 
     def test_defaults_match_protocol_defaults(self):

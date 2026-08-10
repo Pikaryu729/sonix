@@ -27,6 +27,7 @@ from sonix.server.protocol import (
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
     DEFAULT_KEEP_ALIVE_TIMEOUT,
+    DEFAULT_SERVER_HEADER,
     DEFAULT_WRITE_PAUSE_WATERMARK,
     DEFAULT_WRITE_RESUME_WATERMARK,
     DEFAULT_WS_PAUSE_WATERMARK,
@@ -204,6 +205,16 @@ class Config:
     ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL
     ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT
 
+    # RFC 9110 section 6.6.1: an origin server with a clock sends Date.
+    # Beyond conformance this is a fairness matter -- uvicorn sends both, and a
+    # benchmark in which Sonix writes fewer bytes per response would be
+    # flattering itself rather than measuring anything.
+    date_header: bool = True
+    # None omits the header entirely; uvicorn spells that --no-server-header.
+    # One knob rather than a flag plus a value, so "which server does it claim
+    # to be" and "does it claim anything" stay the same question.
+    server_header: bytes | None = DEFAULT_SERVER_HEADER
+
     # Which Upgrade offers actually switch the connection off HTTP. Empty
     # disables upgrades entirely, and any offer not listed is answered as an
     # ordinary HTTP request.
@@ -239,6 +250,8 @@ class Config:
             ws_resume_watermark=self.ws_resume_watermark,
             ws_ping_interval=self.ws_ping_interval,
             ws_ping_timeout=self.ws_ping_timeout,
+            date_header=self.date_header,
+            server_header=self.server_header,
             upgrade_protocols=self.upgrade_protocols,
             server_state=state,
             state=lifespan_state,

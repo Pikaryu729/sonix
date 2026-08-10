@@ -15,6 +15,8 @@ import enum
 import functools
 import http
 import os
+import time
+from email.utils import formatdate
 from typing import cast
 
 from sonix.server.parser import (
@@ -70,6 +72,38 @@ DEFAULT_WS_RESUME_WATERMARK = 8
 # check. These match uvicorn's --ws-ping-interval/--ws-ping-timeout defaults.
 DEFAULT_WS_PING_INTERVAL = 20.0
 DEFAULT_WS_PING_TIMEOUT = 20.0
+
+DEFAULT_SERVER_HEADER = b"sonix"
+
+# Formatting a date costs more than writing one, and every response inside the
+# same second wants the identical string. Module-level rather than
+# per-connection because the value is global: two connections in the same
+# second must not disagree about what time it is.
+_date_cache: tuple[int, bytes] = (0, b"")
+
+
+def _formatted_date(now: float) -> bytes:
+    """The current time as an RFC 9110 IMF-fixdate, memoized per second.
+
+    email.utils.formatdate rather than time.strftime("%a, %d %b %Y ... GMT"):
+    strftime's %a and %b are locale-dependent, so under a non-C LC_TIME that
+    spelling emits a date no HTTP client is required to parse. formatdate
+    carries its own English tables and cannot drift.
+
+    Takes `now` rather than calling time.time() itself, so it stays a function
+    of its argument and the memoization is testable without sleeping. No
+    background refresh task (uvicorn's approach): one time.time() call and an
+    int comparison per response costs less than owning a timer that has to be
+    created, cancelled, and reasoned about across graceful shutdown.
+    """
+    global _date_cache
+    second = int(now)
+    cached_second, cached = _date_cache
+    if second != cached_second:
+        cached = formatdate(second, usegmt=True).encode("ascii")
+        _date_cache = (second, cached)
+    return cached
+
 
 _PARSER_ERROR_STATUS: dict[type[HTTPParserError], int] = {
     MalformedRequest: 400,
@@ -218,15 +252,41 @@ def _encode_response_head(
     *,
     close: bool,
     http_version: str = "1.1",
+    date: bytes | None = None,
+    server: bytes | None = None,
 ) -> bytes:
+    """Serialize a response head. Pure: the clock is read by the caller.
+
+    ``date`` and ``server`` are pre-formatted values rather than flags
+    precisely so this stays a function of its arguments, unit-testable with no
+    event loop and no wall clock. Either None omits that header.
+
+    An application-supplied header always wins, mirroring the existing
+    Connection rule: an app that sets its own Date (a cache proxy replaying an
+    origin response) or its own Server must not end up with two.
+    """
     lines = [
         b"HTTP/%s %d %s"
         % (http_version.encode("ascii"), status, _reason_phrase(status))
     ]
-    has_connection = any(name.lower() == b"connection" for name, _ in headers)
-    lines.extend(name + b": " + value for name, value in headers)
+    # One pass rather than three any() scans: this runs on every response, and
+    # the benchmark is the reason these headers exist at all.
+    has_connection = has_date = has_server = False
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered == b"connection":
+            has_connection = True
+        elif lowered == b"date":
+            has_date = True
+        elif lowered == b"server":
+            has_server = True
+        lines.append(name + b": " + value)
     if not has_connection:
         lines.append(b"Connection: close" if close else b"Connection: keep-alive")
+    if date is not None and not has_date:
+        lines.append(b"Date: " + date)
+    if server is not None and not has_server:
+        lines.append(b"Server: " + server)
     return b"\r\n".join(lines) + b"\r\n\r\n"
 
 
@@ -298,6 +358,8 @@ class HTTPProtocol(asyncio.Protocol):
         ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK,
         ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL,
         ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT,
+        date_header: bool = True,
+        server_header: bytes | None = DEFAULT_SERVER_HEADER,
         upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS,
         server_state: ServerState | None = None,
         state: dict | None = None,
@@ -317,6 +379,8 @@ class HTTPProtocol(asyncio.Protocol):
         self._ws_resume_watermark = ws_resume_watermark
         self._ws_ping_interval = ws_ping_interval
         self._ws_ping_timeout = ws_ping_timeout
+        self._date_header = date_header
+        self._server_header = server_header
         self._upgrade_protocols = upgrade_protocols
         self._server_state = server_state
         self._state = state
@@ -401,6 +465,16 @@ class HTTPProtocol(asyncio.Protocol):
         if self._server_state is not None:
             self._server_state.connections.add(self)
 
+    def _head_extras(self) -> tuple[bytes | None, bytes | None]:
+        """The (date, server) values for one response.
+
+        The single place in this module that reads the wall clock, so that
+        _encode_response_head stays pure. Note time.time(), not loop.time():
+        the loop's clock is monotonic and says nothing about the date.
+        """
+        date = _formatted_date(time.time()) if self._date_header else None
+        return date, self._server_header
+
     # -- the connection timer ---------------------------------------------------
 
     def _arm_timeout(self, mode: _TimerMode) -> None:
@@ -470,6 +544,7 @@ class HTTPProtocol(asyncio.Protocol):
         # unambiguous, and RFC 9110 section 15.5.9 is explicit that it is the
         # right answer to a client that connected and then went quiet.
         body = b"Request Timeout"
+        date, server = self._head_extras()
         head = _encode_response_head(
             408,
             [
@@ -477,6 +552,8 @@ class HTTPProtocol(asyncio.Protocol):
                 (b"content-type", b"text/plain; charset=utf-8"),
             ],
             close=True,
+            date=date,
+            server=server,
         )
         self.transport.write(head + body)
         self.transport.close()
@@ -672,6 +749,7 @@ class HTTPProtocol(asyncio.Protocol):
         extra_headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
         reason = _reason_phrase(status) or b"Bad Request"
+        date, server = self._head_extras()
         head = _encode_response_head(
             status,
             [
@@ -680,6 +758,8 @@ class HTTPProtocol(asyncio.Protocol):
                 *(extra_headers or []),
             ],
             close=True,
+            date=date,
+            server=server,
         )
         await my_turn.wait()
         if self.transport is not None and not self.transport.is_closing():
@@ -788,12 +868,18 @@ class HTTPProtocol(asyncio.Protocol):
                     close = True
                 await my_turn.wait()
                 if self.transport is not None and not self.transport.is_closing():
+                    # Encoded here, inside the post-validation branch, so a
+                    # head that _validate_response_headers rejects writes
+                    # nothing at all -- including no Date.
+                    date_value, server_value = self._head_extras()
                     self.transport.write(
                         _encode_response_head(
                             status,
                             headers,
                             close=close,
                             http_version=head.http_version,
+                            date=date_value,
+                            server=server_value,
                         )
                     )
             elif msg_type == "http.response.body":
@@ -1162,6 +1248,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._ws_state = _WSState.CLOSED
         self._enqueue_ws_disconnect(CloseCode.NORMAL)
         await my_turn.wait()
+        date, server = self._head_extras()
         head = _encode_response_head(
             403,
             [
@@ -1169,6 +1256,8 @@ class HTTPProtocol(asyncio.Protocol):
                 (b"content-type", b"text/plain; charset=utf-8"),
             ],
             close=True,
+            date=date,
+            server=server,
         )
         self._ws_write(head)
         if self.transport is not None and not self.transport.is_closing():

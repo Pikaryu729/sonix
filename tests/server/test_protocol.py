@@ -1,10 +1,17 @@
 import asyncio
 import struct
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import pytest
 
 from sonix.server.parser import RequestHead
-from sonix.server.protocol import HTTPProtocol, build_scope
+from sonix.server.protocol import (
+    HTTPProtocol,
+    _encode_response_head,
+    _formatted_date,
+    build_scope,
+)
 from sonix.server.websockets import (
     BinaryMessage,
     CloseReceived,
@@ -1229,3 +1236,126 @@ class TestWriteBackpressure:
         protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
         await asyncio.sleep(0.05)
         assert bytes(transport.written).startswith(b"HTTP/1.1 200 OK\r\n")
+
+
+class TestResponseHeadEncoding:
+    """The pure encoder: no loop, no wall clock, no transport."""
+
+    def test_date_and_server_are_appended(self):
+        head = _encode_response_head(
+            200, [], close=False, date=b"Thu, 01 Jan 1970 00:00:00 GMT", server=b"sonix"
+        )
+        assert b"\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n" in head
+        assert b"\r\nServer: sonix\r\n" in head
+
+    def test_neither_is_emitted_when_none(self):
+        head = _encode_response_head(200, [], close=False)
+        assert b"date:" not in head.lower()
+        assert b"server:" not in head.lower()
+
+    def test_an_app_supplied_date_wins(self):
+        head = _encode_response_head(
+            200, [(b"date", b"yesterday")], close=False, date=b"today"
+        )
+        assert head.lower().count(b"\r\ndate:") == 1
+        assert b"yesterday" in head
+
+    def test_an_app_supplied_server_wins_regardless_of_case(self):
+        # The .lower() arm: a header is a header whatever case it arrives in.
+        head = _encode_response_head(
+            200, [(b"Server", b"theirs")], close=False, server=b"sonix"
+        )
+        assert head.lower().count(b"\r\nserver:") == 1
+        assert b"theirs" in head
+
+    def test_application_headers_still_come_first(self):
+        head = _encode_response_head(
+            200, [(b"content-length", b"2")], close=False, date=b"D", server=b"S"
+        )
+        assert head.index(b"content-length") < head.index(b"Date:")
+
+
+class TestFormattedDate:
+    def test_the_epoch_is_an_imf_fixdate(self):
+        # A fixed vector, so the format itself is pinned rather than just its
+        # shape. RFC 9110 section 5.6.7 spells this out exactly.
+        assert _formatted_date(0.0) == b"Thu, 01 Jan 1970 00:00:00 GMT"
+
+    def test_the_same_second_returns_the_identical_object(self):
+        first = _formatted_date(1000.0)
+        assert _formatted_date(1000.9) is first
+
+    def test_a_new_second_recomputes(self):
+        assert _formatted_date(1001.0) != _formatted_date(1002.0)
+
+
+class TestDateAndServerHeaders:
+    async def test_a_response_carries_both(self):
+        protocol, transport = make_protocol(fixed_response_app)
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        assert b"\r\nServer: sonix\r\n" in written
+        assert b"\r\nDate: " in written
+
+    async def test_the_date_is_the_current_time(self):
+        protocol, transport = make_protocol(fixed_response_app)
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        raw = bytes(transport.written).split(b"\r\nDate: ")[1].split(b"\r\n")[0]
+        sent = parsedate_to_datetime(raw.decode())
+        now = datetime.now(UTC)
+        assert abs((now - sent).total_seconds()) < 5
+
+    async def test_both_can_be_disabled(self):
+        protocol, transport = make_protocol(
+            fixed_response_app, date_header=False, server_header=None
+        )
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written).lower()
+        assert b"\r\ndate:" not in written
+        assert b"\r\nserver:" not in written
+
+    async def test_the_408_carries_a_date(self):
+        # The failure paths are responses too.
+        _protocol, transport = make_protocol(fixed_response_app, head_timeout=0.05)
+        await asyncio.sleep(0.15)
+        assert b"\r\nDate: " in bytes(transport.written)
+
+    async def test_a_400_carries_a_date(self):
+        protocol, transport = make_protocol(fixed_response_app)
+        protocol.data_received(b"GET/HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        assert b"\r\nDate: " in bytes(transport.written)
+
+    async def test_the_101_carries_no_date(self):
+        # RFC 9110 section 6.6.1 requires Date on responses of status 200 or
+        # greater and excludes 1xx. The handshake also does not go through
+        # _encode_response_head at all, which is what keeps it that way.
+        protocol, transport = make_protocol(make_ws_app())
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        head = written[: written.index(b"\r\n\r\n")]
+        assert b"date:" not in head.lower()
+
+    async def test_a_rejected_head_still_writes_nothing(self):
+        # The guard on where the encode happens: a head that fails validation
+        # must not leak a Date onto the wire ahead of the error.
+        async def bad_app(scope: Scope, receive: Receive, send: Send) -> None:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-length", b"2"),
+                        (b"transfer-encoding", b"chunked"),
+                    ],
+                }
+            )
+
+        protocol, transport = make_protocol(bad_app)
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        assert transport.written == b""
