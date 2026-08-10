@@ -10,9 +10,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Fail rather than silently resolving a different version than uv.lock pins.
-  UV_FROZEN: "1"
+# Every job syncs with `--locked`, which fails rather than silently resolving a
+# different version than uv.lock pins. Deliberately NOT paired with UV_FROZEN:
+# uv rejects the two together outright ("the argument `--locked` cannot be used
+# with `UV_FROZEN`"), and this workflow set both, so every step failed in under
+# a second and CI had never actually run. `--locked` is the stronger of the two
+# anyway -- it verifies the lockfile is up to date, where --frozen only skips
+# the check.
 
 jobs:
   lint:
