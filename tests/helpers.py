@@ -38,9 +38,35 @@ _BASE_SCOPE: dict[str, Any] = {
 }
 
 
+# The websocket equivalent. Deliberately not make_scope(type="websocket"):
+# that would leave "method" in place, and a websocket scope having no method
+# is exactly the difference that breaks code assuming there is one.
+_BASE_WS_SCOPE: dict[str, Any] = {
+    "type": "websocket",
+    "asgi": {"version": "3.0", "spec_version": "2.3"},
+    "http_version": "1.1",
+    "scheme": "ws",
+    "path": "/ws",
+    "raw_path": b"/ws",
+    "query_string": b"",
+    "root_path": "",
+    "headers": [(b"host", b"example.com")],
+    "client": ("127.0.0.1", 54321),
+    "server": ("127.0.0.1", 8000),
+    "subprotocols": [],
+}
+
+
 def make_scope(**overrides: Any) -> Scope:
     """Build an HTTP scope, overriding any key."""
     scope = dict(_BASE_SCOPE)
+    scope.update(overrides)
+    return scope
+
+
+def make_ws_scope(**overrides: Any) -> Scope:
+    """Build a websocket scope, overriding any key."""
+    scope = dict(_BASE_WS_SCOPE)
     scope.update(overrides)
     return scope
 
