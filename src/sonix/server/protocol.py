@@ -38,6 +38,27 @@ _PARSER_ERROR_STATUS: dict[type[HTTPParserError], int] = {
 }
 
 
+class ServerState:
+    """Cross-connection state shared by every protocol instance of one server.
+
+    Lives here rather than in server.py so that protocol.py doesn't have to
+    import from the module that imports *it*. It holds only what graceful
+    shutdown needs: the set of live connections, and a flag telling them a
+    shutdown is in progress so they stop advertising keep-alive.
+
+    This is the single exception to "no mutable state is shared across
+    connections" -- and it is why connections register and deregister
+    themselves rather than the server tracking them from the outside, which
+    would leak entries for connections that died without notice.
+    """
+
+    __slots__ = ("connections", "should_exit")
+
+    def __init__(self) -> None:
+        self.connections: set[HTTPProtocol] = set()
+        self.should_exit = False
+
+
 # -- pure helpers, no event loop involved -----------------------------------
 
 
@@ -170,6 +191,7 @@ class HTTPProtocol(asyncio.Protocol):
         head_timeout: float = DEFAULT_HEAD_TIMEOUT,
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
+        server_state: ServerState | None = None,
     ) -> None:
         self.app = app
         self._max_header_size = max_header_size
@@ -178,8 +200,14 @@ class HTTPProtocol(asyncio.Protocol):
         self._head_timeout = head_timeout
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
+        self._server_state = server_state
         self.transport: asyncio.Transport | None = None
         self.parser: HTTP11Parser | None = None
+
+    @property
+    def is_idle(self) -> bool:
+        """True when no request is in flight, so closing now loses nothing."""
+        return not self._inflight_tasks
 
     # -- connection lifecycle ------------------------------------------------
 
@@ -208,6 +236,9 @@ class HTTPProtocol(asyncio.Protocol):
         self._head_timeout_handle: asyncio.TimerHandle | None = self._loop.call_later(
             self._head_timeout, self._on_head_timeout
         )
+
+        if self._server_state is not None:
+            self._server_state.connections.add(self)
 
     def _disarm_head_timeout(self) -> None:
         if self._head_timeout_handle is not None:
@@ -246,6 +277,8 @@ class HTTPProtocol(asyncio.Protocol):
         self._closed = True
         self._disarm_head_timeout()
         self._disconnected = True
+        if self._server_state is not None:
+            self._server_state.connections.discard(self)
         for queue in self._receive_queues:
             queue.put_nowait({"type": "http.disconnect"})
         # Deferred via call_soon (not called directly): a task blocked in
@@ -422,6 +455,12 @@ class HTTPProtocol(asyncio.Protocol):
                 headers = list(message.get("headers", []))
                 _validate_response_headers(headers)
                 close = _decide_close(head, headers)
+                # A shutdown started while this request was in flight: finish
+                # it, but tell the client not to reuse the connection. Without
+                # this the client sees keep-alive on a socket the server is
+                # about to close and may pipeline a request into the void.
+                if self._server_state is not None and self._server_state.should_exit:
+                    close = True
                 await my_turn.wait()
                 if self.transport is not None and not self.transport.is_closing():
                     self.transport.write(
