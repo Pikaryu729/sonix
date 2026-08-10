@@ -72,6 +72,50 @@ jobs:
       - name: FastAPI / Starlette on Sonix, and Sonix under uvicorn
         run: uv run --group conformance pytest tests/conformance -v
 
+  websocket-conformance:
+    name: Autobahn WebSocket testsuite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Start the echo server
+        run: |
+          uv run python tests/autobahn/echo_server.py 9001 &
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then exit 0; fi
+            sleep 0.2
+          done
+          echo "echo server never started listening" >&2
+          exit 1
+      # ~500 RFC 6455 cases driven from outside: framing, fragmentation,
+      # UTF-8, close codes, and deliberate protocol abuse. Sections 12 and 13
+      # (permessage-deflate) are excluded in the spec file -- Sonix
+      # negotiates no extensions, which is a documented non-goal rather than
+      # a partial implementation.
+      - name: Run the fuzzing client
+        working-directory: tests/autobahn
+        run: |
+          docker run --rm \
+            -v "$PWD/fuzzingclient.json:/config/fuzzingclient.json" \
+            -v "$PWD/reports:/reports" \
+            --network host \
+            crossbario/autobahn-testsuite \
+            wstest --mode fuzzingclient --spec /config/fuzzingclient.json
+      # wstest always exits 0 -- it reports rather than judges -- so without
+      # this the job would be green whatever the results said.
+      - name: Check the report
+        working-directory: tests/autobahn
+        run: uv run python check_report.py reports/servers/index.json
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: tests/autobahn/reports/
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
