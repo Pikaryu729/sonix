@@ -9,7 +9,7 @@ Directory structure enforces this boundary rather than relying only on conventio
 
 This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework is built.
 
-**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. A public server API (`Config`, `Server`, `sonix.run`) and a `module:app` CLI have since been added on top — not a numbered build-order step, but a prerequisite for both the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo. `uv run sonix` serves that demo end-to-end over a real socket. Middleware, dependency injection, exceptions, and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
+**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. Step 7 (middleware and exceptions, swapped ahead of DI — see the [build order](#build-order)) is also done, along with two modules that were not numbered steps at all: a public server API (`Config`, `Server`, `sonix.run`) with a `module:app` CLI, and `app/lifespan.py`. Neither was optional. The server API is a prerequisite for the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo; lifespan fixed a bug that made a Sonix app unable to run under any other ASGI server. `uv run sonix` serves the built-in demo end-to-end over a real socket, and `uvicorn sonix._demo:app` now serves the same app. Dependency injection and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
 
 ## Module layout
 
@@ -46,11 +46,13 @@ src/sonix/
     responses.py          # Response / JSONResponse / PlainTextResponse / HTMLResponse
     routing.py            # Router/Route: path compiling, param coercion, 404/405
     applications.py       # Sonix app class: @app.get/@app.websocket, dispatch wiring
-    middleware.py         # (planned) ASGI-onion composition + ExceptionMiddleware
+    middleware.py         # ASGI-onion composition + ExceptionMiddleware
+    lifespan.py           # startup/shutdown: the async-context-manager form, the
+                          # on_startup/on_shutdown sugar, and the scope["state"] merge
     di.py                 # (planned) signature inspection, Depends, resolution plan,
                           # per-request caching
     websockets.py         # (planned) WebSocket class built purely from (scope, receive, send)
-    exceptions.py         # (planned) HTTPException and friends
+    exceptions.py         # HTTPException and friends
 ```
 
 Tests mirror this 1:1 under `tests/`:
@@ -66,10 +68,11 @@ tests/
     test_responses.py
     test_routing.py
     test_applications.py
-    test_middleware.py    # (planned)
+    test_middleware.py
+    test_lifespan.py
     test_di.py            # (planned)
     test_websockets.py    # (planned)
-    test_exceptions.py    # (planned)
+    test_exceptions.py
   test_types.py           # the shared ASGI aliases stay exported under their known names
   test_layering.py        # architecture conformance: fails if sonix/app/** imports sonix.server
 ```
@@ -231,10 +234,40 @@ A linear list of compiled route patterns, evaluated in registration order — **
 - Path templates such as `/items/{id:int}` are compiled once at registration time into a regex with named groups, plus a converter registry (`str` by default, excluding `/`; `int`, `float`, `uuid`; `path` for catch-all segments). Coercion happens *as part of matching* — the `int` converter's regex is a numeric character class, not `.+` — so "the path shape matched but the segment couldn't be coerced" is not a reachable state; a non-numeric segment simply fails to match that route and falls through.
 - **Trailing slash:** strict, no implicit redirect. `/items` and `/items/` are distinct routes. Implicit redirect-on-trailing-slash (as Starlette/FastAPI default to) is a known source of subtlety, including POST body loss across a misconfigured redirect; it can be offered later as an opt-in, not as core behavior.
 - **Precedence:** registration order, first match wins — explicit and legible, rather than an automatic specificity-scoring system that trades one kind of surprise for another.
-- **404 vs. 405:** a full scan is required on every request, since a route can't be ruled out until both its path and method are checked. If no route matches the path shape at all, respond 404. If at least one route matches the path shape but none match the method, respond 405 with an `Allow` header accumulated from every method that *did* match the path.
+- **404 vs. 405:** a full scan is required on every request, since a route can't be ruled out until both its path and method are checked. If no route matches the path shape at all, raise `HTTPException(404)`. If at least one route matches the path shape but none match the method, raise `HTTPException(405)` with an `Allow` header accumulated from every method that *did* match the path. These are **raised, not returned** — see `app/middleware.py` below for why, and for what that costs.
 - **Path traversal:** routing itself has no filesystem semantics. This is called out explicitly so that any future static-file-serving feature is responsible for resolving against a whitelisted root and rejecting `..`/encoded escapes — it must not be silently assumed to be routing's job.
 
-### `app/middleware.py` *(planned)*
+### `app/lifespan.py` *(implemented)*
+
+**Not in the original build order** — it was added because `Sonix.__call__` delegated to the router unconditionally, so a `lifespan` scope reached `Router.__call__` and died on `scope["path"]` with a bare `KeyError`. A Sonix application therefore could not run under uvicorn at all, which quietly falsified this document's central claim. `Sonix.__call__` now switches on `scope["type"]`.
+
+The primary API is an async context manager rather than `on_startup`/`on_shutdown` lists:
+
+```python
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    connection = sqlite3.connect(...)
+    yield {"db": connection}
+    connection.close()
+```
+
+It keeps setup and its matching teardown in one function and lets the resource live in a local variable between them, which paired event lists cannot express without a module-level global. The event form remains as sugar. Mixing the two is refused rather than given an arbitrary ordering.
+
+Whatever the context manager yields is merged into `scope["state"]` **in place**, not rebound — the server holds a reference to that dict and copies it into every request scope, so replacing it would silently orphan the server's copy. Each request receives a shallow copy, per the ASGI spec: a handler may stash per-request values without leaking them into the next request, while objects the lifespan opened stay shared.
+
+Failures are reported as `lifespan.startup.failed` / `lifespan.shutdown.failed` messages rather than raised — a server that asked for lifespan is waiting on a reply, and raising would leave it waiting forever.
+
+**The distinction the server-side runner exists to get right** is between *"this app does not speak lifespan"* and *"this app's startup genuinely failed"*. Conflating them is a bug uvicorn shipped historically, and it is asymmetric: an app whose database connection fails must crash the server loudly, never be silently downgraded to running without a lifespan. The rule is that a protocol message always raises, while an exception escaping the app before any message means "unsupported" — tolerated under `lifespan="auto"`, fatal under `"on"`.
+
+Detecting only the raising case is not enough. Returning early on an unrecognized scope type is the more common and more polite way for an app to say it has no lifespan, and it sends nothing at all; such an app was being reported as supported and then hung shutdown waiting for a reply that was never coming. Support is judged on whether startup was ever *acknowledged*, not on whether the app raised.
+
+### `app/exceptions.py` *(implemented)*
+
+`HTTPException(status_code, detail=None, headers=None)`, raised rather than returned, so any layer above routing can say "stop, answer with this status" without constructing a `Response`. `detail` defaults to the status's registered reason phrase.
+
+`app/requests.py` deliberately still raises `ClientDisconnect` rather than an `HTTPException`, keeping that module ignorant of status codes; mapping it is the middleware's job.
+
+### `app/middleware.py` *(implemented)*
 
 **ASGI-onion wrapping**: each middleware is `middleware(app) -> new_app`, where `new_app.__call__(scope, receive, send)` does pre-work, awaits the inner app (optionally wrapping `receive`/`send` to observe or transform messages), then does post-work. This is deliberately not a before/after hook list — a hook list can't express streaming interception of a response body that arrives as multiple `http.response.body` events, whereas onion wrapping is a single composition model shared with the server bridge and the router, rather than a second one to learn.
 
@@ -248,9 +281,20 @@ class SomeMiddleware:
     async def __call__(self, scope, receive, send): ...
 ```
 
-`Sonix` wraps middlewares around the router in reverse registration order, so the first-registered middleware ends up outermost — the same ordering semantics as Starlette.
+`Sonix` wraps middlewares around the router in reverse registration order, so the first-registered middleware ends up outermost. **One rule applies to both** the constructor list and successive `add_middleware()` calls — Starlette's `add_middleware` is LIFO while its constructor list is not, and a single consistent rule is easier to reason about than reproducing that split.
 
-The built-in `ExceptionMiddleware` catches `HTTPException` and converts it to a `Response`, and catches unhandled exceptions and converts them to a 500 (with a debug flag to re-raise instead, for tests). This is what turns a DI failure or a handler bug into an HTTP response instead of a crashed connection.
+The stack is built **once, lazily, on the first request**, because it cannot be assembled until every route and middleware is registered. Registering middleware or an exception handler after that point raises, rather than silently having no effect.
+
+The built-in `ExceptionMiddleware` catches `HTTPException` and converts it to a `Response`, and catches unhandled exceptions and converts them to a 500 (with a debug flag to re-raise instead, for tests). This is what turns a DI failure or a handler bug into an HTTP response instead of a crashed connection. It sits **outermost**, so it also catches failures raised by other middleware, not only by handlers.
+
+Two details that only became apparent once it existed:
+
+- **It wraps `send` to track whether `http.response.start` has already been emitted.** Once the status line is on the wire, an exception cannot be turned into an error response — emitting a second `http.response.start` would corrupt the stream. In that case the exception is re-raised and the server closes the connection, which is the only honest option. Getting this wrong is a classic.
+- **`ClientDisconnect` is swallowed, not converted to a 500.** There is nobody left to answer, and writing to a closed transport is the only thing that could still go wrong.
+
+Handlers may be registered against an exception class or, for `HTTPException`, against a **status code**, so a custom 404 needs no subclass; status lookup wins over class lookup.
+
+**404 and 405 are raised, not returned.** `Router` previously constructed `PlainTextResponse` for them inline, which made them the only two statuses in the framework with no override hook. They are now `HTTPException`s converted like any other error, with the 405's `Allow` header riding along on the exception so a custom handler can still read it. The tradeoff is that `Router` is no longer a complete ASGI app on its own — it expects the `ExceptionMiddleware` that `Sonix` always wraps it in.
 
 Dependency resolution happens *inside route dispatch*, not as a separate middleware layer — it's route- and handler-signature-specific, not a cross-cutting scope-level concern.
 
@@ -309,8 +353,8 @@ The build order is chosen so that each step is independently testable or demoabl
 4. ✅ **`app/requests.py` + `app/responses.py`** — built purely against `types.Scope`/`Receive`/`Send` and tested with a fake scope/receive/send, with `server/` not involved at all. This proves layer 2's runtime-agnosticism starting from the very first module written in it.
 5. ✅ **`app/routing.py`** — `Router` as an ASGI app, tested standalone against fake scopes.
 6. ✅ **`app/applications.py`** (first pass, no DI or middleware yet) — `Sonix` plus `@app.get`, wired to `server/protocol.py`. This is the first real `curl`-against-a-running-server milestone, and the first point worth taking a `wrk` benchmark checkpoint.
-7. ⬜ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch.
-8. ⬜ **`app/middleware.py`** (with `ExceptionMiddleware`) — onion composition tested against fake inner apps.
+7. ✅ **`app/middleware.py`** (with `ExceptionMiddleware` and `app/exceptions.py`) — onion composition tested against fake inner apps. **Swapped with DI from this document's original order.** DI's failure modes — a missing query parameter becoming a 422, a dependency callable raising — have nowhere to go without an exception layer, so building DI first would mean building it against a hole. `app/lifespan.py` landed alongside, since both required `Sonix.__call__` to switch on `scope["type"]` rather than delegate blindly.
+8. ⬜ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch.
 9. ⬜ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`.
 10. ⬜ **Hardening pass** — header/body/backlog size limits, slow-loris timeouts, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code.
 
