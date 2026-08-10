@@ -37,7 +37,11 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-      - run: uv sync --locked
+      # The conformance group is needed here even though those tests do not
+      # run in this job: ty resolves imports, and tests/conformance/ imports
+      # fastapi and starlette. Without it the job fails on unresolved-import
+      # for files the test job correctly skips.
+      - run: uv sync --locked --group conformance
       - run: uv run ty check
 
   test:
