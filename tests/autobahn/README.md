@@ -42,30 +42,33 @@ be measured -- they are a documented non-goal.
 
 ## Current result
 
-**301 cases, 0 failing, 11 non-strict** (run 31429614696). The 11 fall into
-exactly two classes, both understood:
+**301 cases, 0 failing, 4 non-strict** (run 31441912285).
 
-**Fail-fast UTF-8 — cases 6.4.1 through 6.4.4.** UTF-8 is validated on the
-reassembled message, not mid-fragment. The suite considers detecting an
-invalid sequence as early as possible to be strict; validating per fragment
-instead would reject legitimate traffic where a multi-byte character straddles
-a fragment boundary, so the check happens once the message is whole.
+All four are the same class, and it is a deliberate choice: **UTF-8 is
+validated on the reassembled message, not fail-fast mid-fragment** (cases
+6.4.1 through 6.4.4). The suite treats detecting an invalid sequence as early
+as possible as the strict behaviour; validating per fragment instead would
+reject legitimate traffic where a multi-byte character straddles a fragment
+boundary, so the check happens once the message is whole. Fail-fast
+incremental validation is a hardening item, not a bug.
 
-**A valid message lost to the close that follows it — cases 3.2, 3.3, 4.1.3,
-4.1.4, 4.2.3, 4.2.4 and 5.15.** Each sends a good message *and then* a
-protocol violation, and expects the echo of the good message before the
-connection fails. Sonix's codec does surface the earlier message
-(`WebSocketProtocolError.partial_events` exists precisely for this), and the
-bridge does queue it for the application — but it then writes the close frame
-and closes the transport in the same event-loop callback, before the
-application task has run. So the echo never reaches the wire.
+### Previously non-strict, now fixed
 
-That is a real, if minor, defect rather than a stylistic difference: a message
-the client legitimately sent is dropped. It is RFC-permitted, which is why the
-suite grades it non-strict rather than failed. Fixing it properly means
-deferring both the close frame and the transport close until the application
-task has drained — a change to the connection teardown path, and therefore a
-hardening-pass item rather than something to bolt on here.
+Seven cases -- 3.2, 3.3, 4.1.3, 4.1.4, 4.2.3, 4.2.4 and 5.15 -- used to be
+non-strict too. Each sends a valid message *and then* a protocol violation,
+and expects the echo of the valid message before the connection fails. The
+codec surfaced the earlier message and the bridge queued it, but the bridge
+then wrote the close frame and closed the transport in the same event-loop
+callback, before the application task had run -- so a message the client
+legitimately sent was dropped.
+
+The fix was a `_WSState.CLOSING` window: the close code is decided and the
+disconnect is queued behind the good message, inbound frames stop being
+decoded, outbound sends still go through, and the close frame is written by
+`_on_ws_task_done` once the application has had its turn (bounded by
+`ws_close_timeout`). The same deferral applies to the peer-close path, where
+the old behaviour was worse than dropping a message: the application's echo
+raised `RuntimeError` into the handler.
 
 `INFORMATIONAL` is accepted for section 9, where the suite measures
 throughput rather than asserting behaviour.

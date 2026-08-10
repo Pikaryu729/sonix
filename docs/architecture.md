@@ -165,10 +165,10 @@ Built on a raw `asyncio.Protocol`/transport, **not** `asyncio.start_server`/`Str
 
 Connection lifecycle:
 
-1. **`connection_made(transport)`** — store the transport, instantiate a fresh `HTTP11Parser`, start a slow-loris timeout that closes the connection if a complete request head hasn't arrived within N seconds.
+1. **`connection_made(transport)`** — store the transport, bound its write buffer, instantiate a fresh `HTTP11Parser`, and arm the connection timer in head mode: a complete request head must arrive within `head_timeout` or the connection gets a 408 and is closed.
 2. **`data_received(data)`** — feed bytes into the parser, which returns a list of events (supporting pipelining, since one `data_received` call can complete more than one request). On a head-complete event, build the ASGI `scope` and `asyncio.create_task()` the application call. On body-chunk events, push into a per-request `asyncio.Queue` that backs `receive()`. On a parser error, write the appropriate 4xx response and close — no resync attempts, no keep-alive after an error.
 3. **`send()` bridge** — writes `http.response.start`/`http.response.body` to `transport.write()`, and validates that `start` always precedes `body`. This is a defensive ASGI-contract check baked into the bridge, not just an assumption about well-behaved application code.
-4. **Keep-alive** — after a full request/response cycle, the transport is reused unless `Connection: close` was requested; responses to pipelined requests are written back in request order.
+4. **Keep-alive** — after a full request/response cycle the transport is reused unless `Connection: close` was requested, and the timer re-arms in idle mode (`keep_alive_timeout`) so an unused connection is reaped rather than held forever; responses to pipelined requests are written back in request order.
 5. **`connection_lost(exc)`** — delivers `{"type": "http.disconnect"}` to a `receive()` call that's currently awaiting, and cancels the in-flight application task cleanly (no swallowed `CancelledError`) instead of leaking it.
 6. **Concurrency** — one task per in-flight request, with state scoped to the `HTTPProtocol` instance (i.e., per-connection). No mutable state is shared across connections.
 
@@ -179,6 +179,8 @@ Three details that only surfaced once this ran against a real socket, all of the
 - **The write turnstile.** Pipelined requests run as concurrent tasks, but HTTP/1.1 requires their responses on the wire in request order. On dispatch, each request takes the current turnstile event as the one it must await before writing its response head, and installs a fresh event in its place for whichever request comes next — then sets that fresh event once its own body is complete. The result is a chain of events linking the in-flight requests in arrival order. The error path waits on the same turnstile: a parser failure discovered mid-buffer must not close the transport before the good pipelined responses ahead of it have been written, or they're silently dropped against a closed transport.
 - **Dangling heads are dropped, not dispatched.** A parser error's `partial_events` can end mid-request — a `RequestHeadComplete` with no matching `RequestComplete`, because body framing is exactly what failed. Dispatching that head would spawn a task whose `receive()` can never be satisfied; it would hang forever and, through the turnstile, block every response behind it including the error response. Only events belonging to fully completed requests are replayed.
 - **Cancellation is deferred by one loop iteration.** `connection_lost` puts `http.disconnect` on every live receive queue and then cancels the in-flight tasks — but via `call_soon`, not directly. `put_nowait` only *schedules* the resumption of a task blocked in `queue.get()`; cancelling synchronously races it, and `Task.cancel()` on a task whose awaitable is already done falls back to `_must_cancel`, discarding the disconnect message the app was about to observe.
+- **A silent connection is two different conditions.** The timer has two modes and picking the wrong one is the sharpest trap in the connection layer. *Awaiting a head* gets `head_timeout` and answers **408**. *Idle between requests* gets `keep_alive_timeout` and closes **silently** — a 408 there would reach a client with nothing outstanding, which will pair it with whatever request it writes next, possibly one already in flight. What separates them after a response is whether the parser has buffered bytes: if it has, the next head is already partly here, and that is slow loris rather than idleness. Reading it backwards hands the attacker the more generous deadline. `HTTP11Parser.mid_request` exists to answer exactly that, and a test inverts the two modes to prove the distinction is load-bearing. Promotion from idle to head mode happens only on the idle→mid-request *transition*, so a one-byte-per-second drip cannot keep extending its own deadline.
+- **One drain waiter is not enough.** `_drain` originally held a single future. That is correct only while exactly one coroutine can be writing — and a websocket application with a reader task and a writer task breaks it: the second caller's future replaced the first's, and the first was never resolved. The cure was the connection dying. It is a list now, woken on `connection_lost` as well as on `resume_writing`, since a blocked writer on a dead connection is waiting for a resume that is never coming.
 
 ### `server/server.py` — server lifecycle *(implemented)*
 
@@ -222,6 +224,30 @@ beyond ergonomics: it lets the benchmark harness launch Sonix and uvicorn with
 structurally identical command lines, so the comparison isn't quietly measuring two
 different startup paths.
 
+#### `Date` and `Server` on every response
+
+RFC 9110 §6.6.1 says an origin server with a clock sends `Date`. Beyond
+conformance this is a **fairness** matter, and that is why it lands in the
+hardening pass rather than after it: uvicorn sends both headers, and a
+benchmark in which Sonix wrote fewer bytes per response would be flattering
+itself rather than measuring anything.
+
+`_encode_response_head` stays pure — it takes pre-formatted `date`/`server`
+bytes rather than flags, so it remains a function of its arguments and
+unit-testable with no event loop and no wall clock. `_head_extras()` is the
+single place in the module that reads the clock, and the date is memoized per
+second, since every response inside the same second wants the identical
+string. No background refresh task: one `time.time()` call and an int
+comparison per response costs less than owning a timer that must be created,
+cancelled and reasoned about across graceful shutdown.
+
+`email.utils.formatdate`, not `strftime`: `%a` and `%b` are locale-dependent,
+so that spelling emits a date under a non-C `LC_TIME` that no HTTP client is
+required to parse. An application-supplied `Date` or `Server` wins, mirroring
+the existing `Connection` rule. The `101` carries neither — RFC 9110 excludes
+1xx from `Date`, and the handshake deliberately does not go through this
+encoder.
+
 ### `server/websockets.py` — handshake and frame codec *(implemented)*
 
 Protocol-level only, no application-facing API, and no `asyncio` import — the same posture as `parser.py`, and testable the same way: 110 tests that never touch an event loop.
@@ -261,9 +287,9 @@ Three details that make those correct rather than merely present:
 
 The 101 response has its own encoder rather than reusing `protocol.py`'s, which always appends a `Connection: keep-alive`/`close` header. On a 101 that header is wrong and strict clients reject the upgrade over it.
 
-**Verified from outside.** The [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite) drives a Sonix echo server as a blocking CI job: **301 cases, 0 failing, 11 non-strict**. An unmodified Starlette WebSocket application, driven by the independently written `websockets` client, also runs on Sonix's server in the conformance suite. Our own tests can only show the codec agrees with itself.
+**Verified from outside.** The [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite) drives a Sonix echo server as a blocking CI job: **301 cases, 0 failing, 4 non-strict**. An unmodified Starlette WebSocket application, driven by the independently written `websockets` client, also runs on Sonix's server in the conformance suite. Our own tests can only show the codec agrees with itself.
 
-The 11 non-strict results are two known classes, both recorded in `tests/autobahn/README.md`: the fail-fast UTF-8 cases above, and — more interesting — seven cases (3.2, 3.3, 4.1.x, 4.2.x, 5.15) where a valid message arrives in the same batch as a subsequent protocol violation and its echo is expected before the connection fails. The codec surfaces that message via `partial_events` and the bridge queues it, but the bridge then writes the close frame and closes the transport in the same event-loop callback, before the application task has run, so the echo never reaches the wire. **A message the client legitimately sent is dropped**, which is a real defect rather than a stylistic difference; it is RFC-permitted, which is why it grades non-strict. Fixing it means deferring both the close frame and the transport close until the application task has drained — connection-teardown work, so a step-10 item.
+All four non-strict results are the fail-fast UTF-8 class above (cases 6.4.x), which is a deliberate choice. Seven more used to be non-strict and are now OK — see the deferred close in the bridge section below, which is what fixed them.
 
 ## The ASGI bridge (`types.py` + bridge logic in `server/protocol.py`)
 
@@ -317,11 +343,17 @@ Sequencing guarantees are enforced defensively at the bridge, not just assumed:
 
 ### The websocket half of the bridge
 
-The connection runs a three-state machine — `CONNECTING → CONNECTED → CLOSED` — and the application's whole vocabulary is `websocket.connect` / `accept` / `receive` / `send` / `close` / `disconnect`. No opcode, mask or frame boundary crosses the boundary, which is what makes the layering rule hold structurally rather than by discipline.
+The connection runs a four-state machine — `CONNECTING → CONNECTED → CLOSING → CLOSED` — and the application's whole vocabulary is `websocket.connect` / `accept` / `receive` / `send` / `close` / `disconnect`. No opcode, mask or frame boundary crosses the boundary, which is what makes the layering rule hold structurally rather than by discipline.
 
 **The upgrade is a connection mode switch, not a kind of request.** `HTTP11Parser` is never fed again; bytes go to the frame parser. That one decision resolves the write turnstile for free: the websocket task holds a turnstile it never releases, which is inert *only because* the parser guarantees no successor request can exist to wait on it. It still takes the turnstile, so a response pipelined ahead of the handshake lands before the 101. (`_fail` explicitly refuses to run in websocket mode — it is unreachable, but reaching it would await an `Event` nobody will ever set.)
 
-**Close handling and ping/pong live here, invisible to the application.** ASGI defines no `websocket.ping` message, so auto-pong is the only conforming answer rather than a preference. An inbound close is echoed — payloadless when the peer sent no code, since 1005 is a report-only sentinel — and the disconnect is enqueued **before** the transport closes, so an application blocked in `receive()` sees the real code instead of the 1006 that `connection_lost` would otherwise deliver first. A handler that simply returns gets a 1000; without that the socket dangles for the life of the process.
+**The close is deferred until the application task has drained**, and `CLOSING` is what that state exists for. A valid message and a close trigger can arrive in the same batch: the message is queued for the application, and if the close frame went out in that same event-loop callback the application's answer would never reach the wire. Worse, on the peer-close path — a client saying one last thing and then closing, which is ordinary traffic — the application's `send` would raise `RuntimeError`, so the bug manufactured a spurious handler failure rather than merely dropping a message.
+
+So during `CLOSING` the code is already decided and the disconnect is already queued *behind* the good message; inbound frames stop being decoded, since nothing the peer says can change the outcome; outbound sends still go through; and `_on_ws_task_done` writes the frame once the handler has ended on its own. This is the websocket counterpart of `_fail()`, which solves the identical HTTP-side problem — the contrast worth noting is that `_fail` synchronizes on the write turnstile, and here there is none (a websocket task holds one it never releases), so the synchronization point is the task itself.
+
+Three details are load-bearing. An application `websocket.close` during `CLOSING` is a **no-op, not an override**: `finally: await ws.close()` is the standard handler shape, and honouring it would put 1000 on the wire where the peer is owed 1002. The deferral is bounded by `ws_close_timeout`, or a hung handler would pin the socket after a protocol violation and turn a DoS defense into a DoS. And the disconnect is still enqueued *synchronously*, so the real code is recorded before `connection_lost` can enqueue 1006. Graceful shutdown deliberately does **not** defer — the server is going away, no message could still usefully be sent, and waiting would make the drain depend on handler behaviour — but it does respect a close already in flight rather than relabelling it 1001.
+
+**Ping/pong and the close handshake live here, invisible to the application.** ASGI defines no `websocket.ping` message, so auto-pong is the only conforming answer rather than a preference. An inbound close is echoed — payloadless when the peer sent no code, since 1005 is a report-only sentinel — and the disconnect is enqueued **before** the transport closes, so an application blocked in `receive()` sees the real code instead of the 1006 that `connection_lost` would otherwise deliver first. A handler that simply returns gets a 1000; without that the socket dangles for the life of the process.
 
 Disconnect codes: the peer's code, or 1005 when its close was payloadless; 1006 when the transport vanished without a close; the codec's code on a protocol violation; 1001 on server shutdown.
 
@@ -518,7 +550,7 @@ The build order is chosen so that each step is independently testable or demoabl
 7. ✅ **`app/middleware.py`** (with `ExceptionMiddleware` and `app/exceptions.py`) — onion composition tested against fake inner apps. **Swapped with DI from this document's original order.** DI's failure modes — a missing query parameter becoming a 422, a dependency callable raising — have nowhere to go without an exception layer, so building DI first would mean building it against a hole. `app/lifespan.py` landed alongside, since both required `Sonix.__call__` to switch on `scope["type"]` rather than delegate blindly.
 8. ✅ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch. Two additions beyond the original design: generator (`yield`) dependencies with an `AsyncExitStack`, without which `Depends(get_db)` is a demo rather than a usable feature; and precomputed fast-path flags on the plan, without which step 10's benchmark would have measured an `AsyncExitStack` allocated per request for handlers that need none.
 9. ✅ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`. Three things arrived beyond the original sketch, each because leaving it out would have been a bug rather than a simplification: a terminal `UPGRADED` state in the parser, which turned out to close a smuggling hole; active close-with-1001 on shutdown, because a websocket is never idle and would otherwise burn the whole drain deadline; and `require_mask`/`mask=` on the codec, which makes it usable as a client and so lets the tests drive it from both ends.
-10. ⬜ **Hardening pass** — a re-armable keep-alive/idle timeout (the current one covers only the first request head, and must stay conditional on the connection still being in HTTP mode), `set_write_buffer_limits()`, `Date`/`Server` response headers, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code. Carried here from step 9: fail-fast incremental UTF-8 validation, deferring a websocket close until the application task has drained (together these are the 11 Autobahn `NON-STRICT` cases), `permessage-deflate` (an explicit non-goal, not a gap), and the O(n) buffer front-deletion both parsers share.
+10. 🟡 **Hardening pass** — the connection half is done: a re-armable keep-alive/idle timeout (the old one covered only the first request head, and re-arming stays conditional on the connection still being in HTTP mode), `set_write_buffer_limits()` plus a fix for a single-slot `_drain` that could hang a websocket application with two sender tasks, `Date`/`Server` response headers, and deferring a websocket close until the application task has drained — which took Autobahn from 11 `NON-STRICT` to 4. What remains: the `wrk` benchmark against FastAPI+uvicorn, and fail-fast incremental UTF-8 validation (the 4 remaining `NON-STRICT` cases). Deliberately still open, not gaps: `permessage-deflate` (an explicit non-goal), the O(n) buffer front-deletion both parsers share, and — newly named rather than newly true — **no idle-read timeout on a request body**, so a declared `Content-Length` dripped a byte per second is bounded in volume by `max_body_size` but not in time.
 
 This yields two concrete demoable milestones along the way — step 3's raw HTTP round trip and step 6's first real `@app.get` — instead of one big-bang integration at the very end. Both have now landed: `uv run sonix` serves a demo app with `@app.get("/")` and `@app.get("/items/{item_id:int}")` over a real socket.
 

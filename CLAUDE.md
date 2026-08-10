@@ -25,7 +25,7 @@ Built so far (build-order steps 1–9):
 
 - `types.py` — shared ASGI type aliases.
 - `server/parser.py` — incremental HTTP/1.1 parser: pure and synchronous, chunked bodies, pipelining, and "reject, never resolve" smuggling defenses.
-- `server/protocol.py` — the `asyncio.Protocol` ↔ ASGI bridge: connection lifecycle, keep-alive, pipelined-response ordering, read/write backpressure, slow-loris timeout.
+- `server/protocol.py` — the `asyncio.Protocol` ↔ ASGI bridge: connection lifecycle, keep-alive, pipelined-response ordering, read/write backpressure, a re-armable two-mode connection timeout (head vs. idle), `Date`/`Server` headers, and the deferred websocket close.
 - `server/server.py` — `Config`/`Server`: socket binding, graceful shutdown, signal handling, and the server-side lifespan runner.
 - `app/requests.py`, `app/responses.py` — `Request`, `Response`/`JSONResponse`/`PlainTextResponse`/`HTMLResponse`.
 - `app/routing.py` — `Router`/`Route`: compiled path templates, param converters, 404 vs. 405.
@@ -42,7 +42,7 @@ The parser owns one more decision than it used to: an upgrade request switches i
 
 `uv run sonix` serves a built-in demo on `127.0.0.1:8000`, and `uv run sonix module:app` serves any app, so changes to either layer can be exercised end-to-end with `curl`.
 
-Not yet built: the example application, and the hardening/benchmark pass (build-order step 10). Follow the shape `docs/architecture.md` sketches unless there's a reason not to, and update that document if you deviate.
+Not yet built: the example application, and the benchmark half of build-order step 10 — the connection-hardening half has landed. Follow the shape `docs/architecture.md` sketches unless there's a reason not to, and update that document if you deviate.
 
 `tests/conformance/` needs its own dependency group (`uv run --group conformance pytest tests/conformance`); a plain `uv run pytest` skips it.
 

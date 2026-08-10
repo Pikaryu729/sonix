@@ -65,7 +65,9 @@ Everything below the application code. Specifically:
 - **A raw `asyncio.Protocol` server** (`server/protocol.py`) — not
   `start_server`/`StreamReader`, because `Protocol` gives direct access to
   `pause_reading()`/`resume_reading()` and write-buffer limits, which is what
-  real backpressure and slow-loris defense require.
+  real backpressure and slow-loris defense require — both directions are
+  actually wired, including an explicit `set_write_buffer_limits()` rather
+  than whatever asyncio defaults to.
 - **A write turnstile** so pipelined requests, which run as concurrent tasks,
   still have their responses written back in request order.
 - **A WebSocket implementation** (`server/websockets.py`) — the handshake, the
@@ -73,8 +75,8 @@ Everything below the application code. Specifically:
   the close handshake, all written against RFC 6455 and unit-tested purely on
   bytes. Checked from the outside by the
   [Autobahn|Testsuite](tests/autobahn/), which CI runs as a blocking job:
-  **301 cases, 0 failing, 11 non-strict** — the non-strict results are two
-  known classes, both written down rather than glossed over.
+  **301 cases, 0 failing, 4 non-strict** — and the four are one known,
+  deliberate class, written down rather than glossed over.
 - **An upgrade that stops HTTP framing**, which turns out to be a
   request-smuggling defense rather than bookkeeping. A request pipelined
   behind a handshake would otherwise be dispatched as a genuine request on a
