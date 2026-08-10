@@ -11,11 +11,13 @@ parsed two different ways by two different pieces of code.
 from __future__ import annotations
 
 import asyncio
+import enum
 import functools
 import http
 from typing import cast
 
 from sonix.server.parser import (
+    DEFAULT_UPGRADE_PROTOCOLS,
     BodyChunk,
     Event,
     HTTP11Parser,
@@ -26,16 +28,49 @@ from sonix.server.parser import (
     RequestHeadComplete,
     RequestTooLarge,
 )
+from sonix.server.websockets import (
+    DEFAULT_MAX_MESSAGE_SIZE,
+    BinaryMessage,
+    CloseCode,
+    CloseReceived,
+    FrameEvent,
+    FrameParser,
+    HandshakeError,
+    Opcode,
+    Ping,
+    Pong,
+    TextMessage,
+    WebSocketProtocolError,
+    encode_close_frame,
+    encode_frame,
+    encode_handshake_response,
+    parse_subprotocols,
+    validate_handshake,
+)
 from sonix.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_HEAD_TIMEOUT = 10.0
 DEFAULT_BODY_PAUSE_WATERMARK = 32
 DEFAULT_BODY_RESUME_WATERMARK = 8
+DEFAULT_WS_PAUSE_WATERMARK = 32
+DEFAULT_WS_RESUME_WATERMARK = 8
 
 _PARSER_ERROR_STATUS: dict[type[HTTPParserError], int] = {
     MalformedRequest: 400,
     RequestTooLarge: 413,
 }
+
+
+class _WSState(enum.Enum):
+    """Where a connection is in the ASGI websocket handshake.
+
+    ``None`` rather than a member of this enum means "still an ordinary HTTP
+    connection" -- the upgrade is a mode switch, not a request kind.
+    """
+
+    CONNECTING = enum.auto()
+    CONNECTED = enum.auto()
+    CLOSED = enum.auto()
 
 
 class ServerState:
@@ -69,20 +104,41 @@ def build_scope(
     server: tuple[str, int] | None,
     state: dict | None = None,
 ) -> Scope:
-    scope: Scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": head.http_version,
-        "method": head.method,
-        "scheme": "http",
-        "path": head.path,
-        "raw_path": head.path.encode("ascii"),
-        "query_string": head.query_string,
-        "root_path": "",
-        "headers": head.headers,
-        "client": client,
-        "server": server,
-    }
+    scope: Scope
+    if head.upgrade == "websocket":
+        # No "method" key: a websocket scope has no HTTP method, which is why
+        # anything reading scope["method"] unconditionally breaks here.
+        # Reading Sec-WebSocket-Protocol is application metadata, not a
+        # framing conclusion, so it does not trespass on the parser's rule.
+        scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": head.http_version,
+            "scheme": "ws",
+            "path": head.path,
+            "raw_path": head.path.encode("ascii"),
+            "query_string": head.query_string,
+            "root_path": "",
+            "headers": head.headers,
+            "client": client,
+            "server": server,
+            "subprotocols": parse_subprotocols(head.headers),
+        }
+    else:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": head.http_version,
+            "method": head.method,
+            "scheme": "http",
+            "path": head.path,
+            "raw_path": head.path.encode("ascii"),
+            "query_string": head.query_string,
+            "root_path": "",
+            "headers": head.headers,
+            "client": client,
+            "server": server,
+        }
     # Per the ASGI spec each request gets a *shallow copy* of the server's
     # lifespan state: handlers may stash per-request values on it without
     # leaking them into the next request, while the shared objects the
@@ -201,6 +257,10 @@ class HTTPProtocol(asyncio.Protocol):
         head_timeout: float = DEFAULT_HEAD_TIMEOUT,
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
+        websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
+        ws_pause_watermark: int = DEFAULT_WS_PAUSE_WATERMARK,
+        ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK,
+        upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS,
         server_state: ServerState | None = None,
         state: dict | None = None,
     ) -> None:
@@ -211,6 +271,10 @@ class HTTPProtocol(asyncio.Protocol):
         self._head_timeout = head_timeout
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
+        self._websocket_max_message_size = websocket_max_message_size
+        self._ws_pause_watermark = ws_pause_watermark
+        self._ws_resume_watermark = ws_resume_watermark
+        self._upgrade_protocols = upgrade_protocols
         self._server_state = server_state
         self._state = state
         self.transport: asyncio.Transport | None = None
@@ -221,6 +285,17 @@ class HTTPProtocol(asyncio.Protocol):
         """True when no request is in flight, so closing now loses nothing."""
         return not self._inflight_tasks
 
+    @property
+    def is_websocket(self) -> bool:
+        """True once this connection stopped being an HTTP connection.
+
+        Note it is deliberately *not* folded into is_idle: a live websocket
+        is honestly busy. Graceful shutdown closes these explicitly rather
+        than draining them, since a session with nothing to say would
+        otherwise hold the drain open to its full deadline.
+        """
+        return self._ws_state is not None
+
     # -- connection lifecycle ------------------------------------------------
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -229,6 +304,7 @@ class HTTPProtocol(asyncio.Protocol):
             max_header_size=self._max_header_size,
             max_headers=self._max_headers,
             max_body_size=self._max_body_size,
+            upgrade_protocols=self._upgrade_protocols,
         )
         self._loop = asyncio.get_running_loop()
         self._client = self.transport.get_extra_info("peername")
@@ -244,6 +320,16 @@ class HTTPProtocol(asyncio.Protocol):
         self._reading_paused = False
         self._paused_writing = False
         self._drain_waiter: asyncio.Future[None] | None = None
+
+        # None means "ordinary HTTP connection". Everything else here stays
+        # unset until an upgrade head arrives.
+        self._ws_state: _WSState | None = None
+        self._ws_parser: FrameParser | None = None
+        self._ws_queue: asyncio.Queue[Message] | None = None
+        self._ws_key: bytes = b""
+        self._ws_prologue: bytes = b""
+        self._ws_close_sent = False
+        self._ws_disconnect_message: Message | None = None
 
         self._head_timeout_handle: asyncio.TimerHandle | None = self._loop.call_later(
             self._head_timeout, self._on_head_timeout
@@ -292,7 +378,15 @@ class HTTPProtocol(asyncio.Protocol):
         if self._server_state is not None:
             self._server_state.connections.discard(self)
         for queue in self._receive_queues:
+            if queue is self._ws_queue:
+                continue
             queue.put_nowait({"type": "http.disconnect"})
+        if self._ws_state is not None:
+            # 1006: the connection went away without a close frame. Skipped
+            # entirely if a real code was already delivered, so a clean 1000
+            # is never overwritten by the abnormal-closure code that follows
+            # every close.
+            self._enqueue_ws_disconnect(CloseCode.ABNORMAL)
         # Deferred via call_soon (not called directly): a task blocked in
         # receive() has its queue.get() future resolved by put_nowait above,
         # but that only *schedules* the task's resumption -- it hasn't run
@@ -329,7 +423,17 @@ class HTTPProtocol(asyncio.Protocol):
     # -- incoming bytes ---------------------------------------------------------
 
     def data_received(self, data: bytes) -> None:
-        if self._closed or self.parser is None:
+        if self._closed:
+            return
+        if self._ws_state is not None:
+            # The upgrade is a connection *mode switch*, not a kind of
+            # request: HTTP11Parser is never fed again, so no second request
+            # head can be emitted for bytes the client believes are tunnelled.
+            # It is also what makes the permanently-held write turnstile below
+            # harmless -- no successor request can ever wait on it.
+            self._ws_data_received(data)
+            return
+        if self.parser is None:
             return
         try:
             events = self.parser.feed_data(data)
@@ -347,11 +451,14 @@ class HTTPProtocol(asyncio.Protocol):
             if not self._got_first_head:
                 self._got_first_head = True
                 self._disarm_head_timeout()
+            if event.head.upgrade == "websocket":
+                self._begin_websocket(event.head)
+                return
             if event.head.upgrade is not None:
-                # The parser has stopped framing HTTP for this connection, so
-                # no body events will ever follow this head. Dispatching it as
-                # an ordinary request would leave an app blocked in receive()
-                # forever. Refuse until the websocket bridge lands.
+                # The parser stopped framing HTTP for this connection, so no
+                # body event will ever follow this head. Dispatching it as an
+                # ordinary request would leave the app blocked in receive()
+                # forever. Only websocket is implemented.
                 self._reject_upgrade()
                 return
             self._begin_request(event.head)
@@ -377,6 +484,14 @@ class HTTPProtocol(asyncio.Protocol):
         task.add_done_callback(self._inflight_tasks.discard)
 
     def _fail(self, exc: HTTPParserError) -> None:
+        if self._ws_state is not None:  # pragma: no cover - data_received guards
+            # Unreachable: once upgraded, data_received routes bytes to the
+            # frame parser and never touches HTTP11Parser again. It is guarded
+            # anyway because getting here would hang the connection forever --
+            # after an upgrade self._write_turnstile is an Event nobody will
+            # ever set, and the failure path below awaits it.
+            self._ws_abort(CloseCode.PROTOCOL_ERROR, "http parsing after upgrade")
+            return
         self._closed = True
         self._disarm_head_timeout()
         status = _PARSER_ERROR_STATUS.get(type(exc), 400)
@@ -392,7 +507,10 @@ class HTTPProtocol(asyncio.Protocol):
         task.add_done_callback(self._inflight_tasks.discard)
 
     async def _write_failure_response(
-        self, status: int, my_turn: asyncio.Event
+        self,
+        status: int,
+        my_turn: asyncio.Event,
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
         reason = _reason_phrase(status) or b"Bad Request"
         head = _encode_response_head(
@@ -400,6 +518,7 @@ class HTTPProtocol(asyncio.Protocol):
             [
                 (b"content-length", str(len(reason)).encode()),
                 (b"content-type", b"text/plain; charset=utf-8"),
+                *(extra_headers or []),
             ],
             close=True,
         )
@@ -547,11 +666,335 @@ class HTTPProtocol(asyncio.Protocol):
             queue is None
         ):  # pragma: no cover - parser always emits BodyChunk after RequestHeadComplete
             raise RuntimeError("received a body chunk with no active request")
+        self._push_to_queue(queue, message, self._body_pause_watermark)
+
+    def _push_to_queue(
+        self, queue: asyncio.Queue[Message], message: Message, watermark: int
+    ) -> None:
+        """Enqueue for the app, pausing reads if it is falling behind.
+
+        Shared by the HTTP body path and the websocket message path so that
+        one flag owns the transport's read state. Two flags both driving one
+        transport is the classic double-resume bug, and after an upgrade the
+        two paths are mutually exclusive anyway.
+        """
         queue.put_nowait(message)
         if (
             not self._reading_paused
             and self.transport is not None
-            and queue.qsize() >= self._body_pause_watermark
+            and queue.qsize() >= watermark
         ):
             self.transport.pause_reading()
             self._reading_paused = True
+
+    # -- websockets --------------------------------------------------------------
+
+    def _begin_websocket(self, head: RequestHead) -> None:
+        assert self.parser is not None
+        # Clients legitimately send their first frame in the same TCP segment
+        # as the handshake, and those bytes are already inside the HTTP
+        # parser's buffer. Without this they would be silently dropped, which
+        # every send-immediately-after-connect client would hit.
+        prologue = self.parser.take_buffer()
+        try:
+            key = validate_handshake(head.headers)
+        except HandshakeError as exc:
+            self._fail_handshake(exc)
+            return
+
+        self._ws_state = _WSState.CONNECTING
+        self._ws_key = key
+        self._ws_prologue = prologue
+        self._ws_parser = FrameParser(max_message_size=self._websocket_max_message_size)
+
+        queue: asyncio.Queue[Message] = asyncio.Queue()
+        self._receive_queues.append(queue)
+        self._ws_queue = queue
+        # ASGI: the server opens the conversation, and the application answers
+        # with accept or close.
+        queue.put_nowait({"type": "websocket.connect"})
+
+        # Hold off reading until the app has decided. Bounds what an
+        # unauthorized client can push at us to a single TCP read.
+        if self.transport is not None and not self._reading_paused:
+            self.transport.pause_reading()
+            self._reading_paused = True
+
+        scope = build_scope(
+            head, client=self._client, server=self._server, state=self._state
+        )
+        my_turn = self._write_turnstile
+        # Installed but never set by the websocket path. Harmless precisely
+        # because the parser is now terminal: no successor request exists to
+        # wait on it. See data_received.
+        my_done = asyncio.Event()
+        self._write_turnstile = my_done
+        send = self._make_ws_send(my_turn)
+        receive = self._make_ws_receive(queue)
+
+        task = asyncio.ensure_future(self.app(scope, receive, send), loop=self._loop)
+        self._inflight_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._on_ws_task_done, my_done=my_done)
+        )
+
+    def _fail_handshake(self, exc: HandshakeError) -> None:
+        self._closed = True
+        self._disarm_head_timeout()
+        my_turn = self._write_turnstile
+        task = self._loop.create_task(
+            self._write_failure_response(exc.status, my_turn, exc.headers)
+        )
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
+
+    def _ws_write(self, data: bytes) -> None:
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.write(data)
+
+    def _ws_data_received(self, data: bytes) -> None:
+        parser = self._ws_parser
+        if parser is None or self._ws_state is _WSState.CLOSED:
+            return
+        try:
+            events = parser.feed_data(data)
+        except WebSocketProtocolError as exc:
+            for event in exc.partial_events:
+                self._handle_frame_event(event)
+            self._ws_abort(exc.code, exc.reason)
+            return
+        for event in events:
+            self._handle_frame_event(event)
+
+    def _handle_frame_event(self, event: FrameEvent) -> None:
+        if isinstance(event, TextMessage):
+            self._push_ws_message({"type": "websocket.receive", "text": event.data})
+        elif isinstance(event, BinaryMessage):
+            self._push_ws_message({"type": "websocket.receive", "bytes": event.data})
+        elif isinstance(event, Ping):
+            # ASGI defines no websocket.ping message, so there is nowhere to
+            # deliver this. Answering with the identical payload is the only
+            # conforming option, and the application never learns it happened.
+            self._ws_write(encode_frame(Opcode.PONG, event.data))
+        elif isinstance(event, Pong):
+            # Unsolicited pongs are legal and mean nothing to us.
+            pass
+        elif isinstance(event, CloseReceived):
+            self._ws_peer_closed(event)
+        else:  # pragma: no cover - exhaustive over FrameEvent
+            raise AssertionError(f"unhandled frame event: {event!r}")  # noqa: TRY004
+
+    def _push_ws_message(self, message: Message) -> None:
+        queue = self._ws_queue
+        if queue is None:  # pragma: no cover - set before any frame can arrive
+            return
+        self._push_to_queue(queue, message, self._ws_pause_watermark)
+
+    def _ws_peer_closed(self, event: CloseReceived) -> None:
+        if not self._ws_close_sent:
+            self._ws_close_sent = True
+            # 1005 is a "no status was present" sentinel and must never go on
+            # the wire, so a payloadless close is echoed payloadless.
+            code = None if event.code == CloseCode.NO_STATUS else event.code
+            self._ws_write(encode_close_frame(code, event.reason))
+        self._finish_websocket(event.code, event.reason)
+
+    def _ws_abort(self, code: int, reason: str) -> None:
+        if not self._ws_close_sent:
+            self._ws_close_sent = True
+            self._ws_write(encode_close_frame(code, reason))
+        self._finish_websocket(code, reason)
+
+    def _finish_websocket(self, code: int, reason: str = "") -> None:
+        self._ws_state = _WSState.CLOSED
+        # Enqueued *before* closing the transport, so an application blocked
+        # in receive() observes the real code rather than the 1006 that
+        # connection_lost would otherwise deliver first.
+        self._enqueue_ws_disconnect(code, reason)
+        if self.transport is not None and not self.transport.is_closing():
+            # close(), never abort(): abort discards the close frame that was
+            # just written.
+            self.transport.close()
+
+    def _enqueue_ws_disconnect(self, code: int, reason: str = "") -> None:
+        if self._ws_disconnect_message is not None:
+            return
+        message: Message = {
+            "type": "websocket.disconnect",
+            "code": int(code),
+            "reason": reason,
+        }
+        self._ws_disconnect_message = message
+        if self._ws_queue is not None:
+            self._ws_queue.put_nowait(message)
+
+    def shutdown_websocket(self) -> None:
+        """Close a live websocket for graceful shutdown.
+
+        Called by the server before it drains, because a websocket connection
+        is never idle: waiting for one to finish on its own would burn the
+        whole shutdown deadline and then hand the client a bare TCP close.
+        """
+        if self._ws_state is None or self._ws_state is _WSState.CLOSED:
+            return
+        if self._ws_state is _WSState.CONNECTED and not self._ws_close_sent:
+            self._ws_close_sent = True
+            self._ws_write(
+                encode_close_frame(CloseCode.GOING_AWAY, "server shutting down")
+            )
+        self._finish_websocket(CloseCode.GOING_AWAY, "server shutting down")
+
+    def _on_ws_task_done(
+        self, task: asyncio.Task[None], *, my_done: asyncio.Event
+    ) -> None:
+        self._inflight_tasks.discard(task)
+        if self._ws_queue is not None:
+            try:
+                self._receive_queues.remove(self._ws_queue)
+            except ValueError:
+                pass
+        if not my_done.is_set():
+            my_done.set()
+        if self._ws_state is _WSState.CONNECTED:
+            # A handler that simply returns has ended the session. Without
+            # this the socket dangles for the life of the process.
+            if not self._ws_close_sent:
+                self._ws_close_sent = True
+                self._ws_write(encode_close_frame(CloseCode.NORMAL))
+            self._finish_websocket(CloseCode.NORMAL)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            if self.transport is not None and not self.transport.is_closing():
+                self.transport.close()
+            self._loop.call_exception_handler(
+                {
+                    "message": "unhandled exception in ASGI application",
+                    "exception": exc,
+                    "protocol": self,
+                }
+            )
+
+    def _make_ws_send(self, my_turn: asyncio.Event) -> Send:
+        async def send(message: Message) -> None:
+            msg_type = message.get("type")
+            state = self._ws_state
+            if state is _WSState.CONNECTING:
+                if msg_type == "websocket.accept":
+                    await self._ws_accept(message, my_turn)
+                elif msg_type == "websocket.close":
+                    await self._ws_deny(my_turn)
+                else:
+                    raise RuntimeError(
+                        f"unexpected ASGI message type {msg_type!r} before "
+                        "websocket.accept"
+                    )
+            elif state is _WSState.CONNECTED:
+                if msg_type == "websocket.send":
+                    self._ws_send_message(message)
+                    await self._drain()
+                elif msg_type == "websocket.close":
+                    self._ws_close(message)
+                elif msg_type == "websocket.accept":
+                    raise RuntimeError("websocket.accept sent more than once")
+                else:
+                    raise RuntimeError(f"unexpected ASGI message type: {msg_type!r}")
+            elif msg_type != "websocket.close":
+                raise RuntimeError(f"{msg_type!r} sent after the websocket was closed")
+            # A close on an already-closed websocket is a no-op rather than an
+            # error: `finally: await ws.close()` is the commonest idiom there
+            # is, and it must not explode because the peer went first.
+
+        return send
+
+    async def _ws_accept(self, message: Message, my_turn: asyncio.Event) -> None:
+        subprotocol = message.get("subprotocol")
+        extra_headers = list(message.get("headers", []))
+        _validate_response_headers(extra_headers)
+        # A pipelined HTTP request ahead of the handshake must have its
+        # response on the wire before the 101.
+        await my_turn.wait()
+        self._ws_state = _WSState.CONNECTED
+        self._ws_write(
+            encode_handshake_response(self._ws_key, subprotocol, extra_headers)
+        )
+        # Lift the pre-accept read bound first, so that if the prologue below
+        # is itself enough to breach the queue watermark, the pause it takes
+        # stands rather than being undone here.
+        if self._reading_paused and self.transport is not None:
+            self.transport.resume_reading()
+            self._reading_paused = False
+        prologue, self._ws_prologue = self._ws_prologue, b""
+        if prologue:
+            self._ws_data_received(prologue)
+
+    async def _ws_deny(self, my_turn: asyncio.Event) -> None:
+        # ASGI: a close before accept is a *denied handshake*, which is an
+        # ordinary HTTP response -- 101 never happens, so neither does a close
+        # frame. It also means "no such websocket route" surfaces as 403
+        # rather than 404; the app layer's only vocabulary for refusal here is
+        # websocket.close.
+        self._ws_state = _WSState.CLOSED
+        self._enqueue_ws_disconnect(CloseCode.NORMAL)
+        await my_turn.wait()
+        head = _encode_response_head(
+            403,
+            [
+                (b"content-length", b"0"),
+                (b"content-type", b"text/plain; charset=utf-8"),
+            ],
+            close=True,
+        )
+        self._ws_write(head)
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.close()
+
+    def _ws_send_message(self, message: Message) -> None:
+        data = message.get("bytes")
+        if data is not None:
+            self._ws_write(encode_frame(Opcode.BINARY, data))
+            return
+        text = message.get("text")
+        if text is None:
+            raise RuntimeError("websocket.send must carry either 'bytes' or 'text'")
+        self._ws_write(encode_frame(Opcode.TEXT, text.encode("utf-8")))
+
+    def _ws_close(self, message: Message) -> None:
+        code = int(message.get("code", CloseCode.NORMAL))
+        reason = message.get("reason") or ""
+        if not self._ws_close_sent:
+            self._ws_close_sent = True
+            self._ws_write(encode_close_frame(code, reason))
+        self._finish_websocket(code, reason)
+
+    def _make_ws_receive(self, queue: asyncio.Queue[Message]) -> Receive:
+        async def receive() -> Message:
+            if not queue.empty():
+                message = queue.get_nowait()
+            elif self._ws_disconnect_message is not None:
+                # Repeat rather than hang: nothing more will ever arrive, and
+                # the code the app already saw is the code it should keep
+                # seeing.
+                return self._ws_disconnect_message
+            elif self._disconnected:
+                return {
+                    "type": "websocket.disconnect",
+                    "code": int(CloseCode.ABNORMAL),
+                    "reason": "",
+                }
+            else:
+                message = await queue.get()
+            if (
+                self._reading_paused
+                # Only once accepted: before that the pause is deliberate, and
+                # resuming here would undo the pre-accept read bound.
+                and self._ws_state is _WSState.CONNECTED
+                and self.transport is not None
+                and queue.qsize() <= self._ws_resume_watermark
+            ):
+                self.transport.resume_reading()
+                self._reading_paused = False
+            return message
+
+        return receive

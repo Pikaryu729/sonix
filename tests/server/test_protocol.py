@@ -1,9 +1,19 @@
 import asyncio
+import struct
 
 import pytest
 
 from sonix.server.parser import RequestHead
 from sonix.server.protocol import HTTPProtocol, build_scope
+from sonix.server.websockets import (
+    BinaryMessage,
+    CloseReceived,
+    FrameParser,
+    Opcode,
+    Pong,
+    TextMessage,
+    encode_frame,
+)
 from sonix.types import Message, Receive, Scope, Send
 
 
@@ -412,38 +422,474 @@ class TestRealSocketRoundTrip:
             await writer.wait_closed()
 
 
-class TestUpgradeNotYetImplemented:
-    """Until the websocket bridge lands, an upgrade head must be refused.
+HANDSHAKE = (
+    b"GET /ws HTTP/1.1\r\n"
+    b"Host: e.com\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n"
+    b"\r\n"
+)
+ACCEPT = b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+CLIENT_MASK = b"\x37\xfa\x21\x3d"
 
-    The parser stops framing HTTP the moment it sees one, so no body events
-    will ever follow. Dispatching it as an ordinary request would leave the
-    application blocked in receive() for the life of the connection.
-    """
 
-    HANDSHAKE = (
-        b"GET /ws HTTP/1.1\r\n"
-        b"Host: e.com\r\n"
-        b"Upgrade: websocket\r\n"
-        b"Connection: Upgrade\r\n"
-        b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        b"Sec-WebSocket-Version: 13\r\n"
-        b"\r\n"
-    )
+def client_frame(opcode: Opcode, payload: bytes = b"", *, fin: bool = True) -> bytes:
+    return encode_frame(opcode, payload, fin=fin, mask=CLIENT_MASK)
 
-    async def test_upgrade_request_gets_501_and_closes(self):
-        protocol, transport = make_protocol(fixed_response_app)
-        protocol.data_received(self.HANDSHAKE)
-        await asyncio.sleep(0.05)
-        assert bytes(transport.written).startswith(b"HTTP/1.1 501 Not Implemented\r\n")
-        assert transport.closed is True
 
-    async def test_pipelined_request_ahead_of_an_upgrade_is_still_answered(self):
-        protocol, transport = make_protocol(fixed_response_app)
-        protocol.data_received(
-            b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\n" + self.HANDSHAKE
-        )
+def server_frames(transport: FakeTransport) -> list:
+    """Decode everything the server wrote after the 101 response."""
+    written = bytes(transport.written)
+    head_end = written.index(b"\r\n\r\n") + 4
+    return FrameParser(require_mask=False).feed_data(written[head_end:])
+
+
+async def echo_ws_app(scope: Scope, receive: Receive, send: Send) -> None:
+    assert scope["type"] == "websocket"
+    await receive()  # websocket.connect
+    await send({"type": "websocket.accept"})
+    while True:
+        message = await receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        if "text" in message and message["text"] is not None:
+            await send({"type": "websocket.send", "text": message["text"]})
+        else:
+            await send({"type": "websocket.send", "bytes": message["bytes"]})
+
+
+def make_ws_app(*, subprotocol=None, headers=None, deny=False):
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await receive()
+        if deny:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        accept: Message = {"type": "websocket.accept"}
+        if subprotocol is not None:
+            accept["subprotocol"] = subprotocol
+        if headers is not None:
+            accept["headers"] = headers
+        await send(accept)
+        await receive()
+
+    return app
+
+
+class TestWebSocketHandshake:
+    async def test_accept_writes_101_with_the_rfc_accept_key(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
         await asyncio.sleep(0.05)
         written = bytes(transport.written)
-        assert written.startswith(b"HTTP/1.1 200 OK\r\n")
-        assert b"501 Not Implemented" in written
-        assert written.index(b"200 OK") < written.index(b"501 Not Implemented")
+        assert written.startswith(b"HTTP/1.1 101 Switching Protocols\r\n")
+        assert b"Sec-WebSocket-Accept: " + ACCEPT + b"\r\n" in written
+        assert b"Upgrade: websocket\r\n" in written
+        # protocol.py's HTTP encoder would have appended one of these, and it
+        # is wrong on a 101.
+        assert b"keep-alive" not in written.lower()
+
+    async def test_scope_is_a_websocket_scope(self):
+        seen = {}
+
+        async def app(scope, receive, send):
+            seen.update(scope)
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert seen["type"] == "websocket"
+        assert seen["scheme"] == "ws"
+        assert seen["path"] == "/ws"
+        assert seen["subprotocols"] == []
+        assert "method" not in seen
+
+    async def test_subprotocols_reach_the_scope_and_the_choice_is_echoed(self):
+        request = HANDSHAKE.replace(
+            b"Sec-WebSocket-Version: 13\r\n",
+            b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat, superchat\r\n",
+        )
+        protocol, transport = make_protocol(make_ws_app(subprotocol="chat"))
+        protocol.data_received(request)
+        await asyncio.sleep(0.05)
+        assert b"Sec-WebSocket-Protocol: chat\r\n" in bytes(transport.written)
+
+    async def test_extra_accept_headers_are_written(self):
+        protocol, transport = make_protocol(make_ws_app(headers=[(b"x-trace", b"abc")]))
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert b"x-trace: abc\r\n" in bytes(transport.written)
+
+    async def test_close_before_accept_is_an_http_403(self):
+        protocol, transport = make_protocol(make_ws_app(deny=True))
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 403 Forbidden\r\n")
+        assert transport.closed is True
+
+    async def test_missing_version_is_426_advertising_13(self):
+        request = HANDSHAKE.replace(b"Sec-WebSocket-Version: 13\r\n", b"")
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(request)
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        assert written.startswith(b"HTTP/1.1 426 ")
+        assert b"sec-websocket-version: 13\r\n" in written
+
+    async def test_bad_key_is_400(self):
+        request = HANDSHAKE.replace(
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            b"Sec-WebSocket-Key: nope\r\n",
+        )
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(request)
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 400 ")
+
+    async def test_unimplemented_upgrade_is_501(self):
+        request = (
+            b"GET / HTTP/1.1\r\nHost: e.com\r\n"
+            b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+        )
+        protocol, transport = make_protocol(
+            fixed_response_app, upgrade_protocols=frozenset({"websocket", "h2c"})
+        )
+        protocol.data_received(request)
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 501 Not Implemented\r\n")
+
+    async def test_upgrade_with_a_body_is_a_400(self):
+        request = HANDSHAKE.replace(
+            b"Sec-WebSocket-Version: 13\r\n",
+            b"Sec-WebSocket-Version: 13\r\nContent-Length: 5\r\n",
+        )
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(request + b"hello")
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 400 ")
+
+    async def test_pipelined_request_ahead_of_the_handshake_is_answered_first(self):
+        # The write turnstile: a websocket task holds its own forever, but it
+        # must still wait for responses queued ahead of it.
+        protocol, transport = make_protocol(_http_then_ws_app)
+        protocol.data_received(b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\n" + HANDSHAKE)
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        assert written.index(b"200 OK") < written.index(b"101 Switching Protocols")
+
+
+async def _http_then_ws_app(scope: Scope, receive: Receive, send: Send) -> None:
+    if scope["type"] == "http":
+        await fixed_response_app(scope, receive, send)
+        return
+    await receive()
+    await send({"type": "websocket.accept"})
+    await receive()
+
+
+class TestWebSocketMessages:
+    async def test_text_round_trip(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.TEXT, "héllo".encode()))
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [TextMessage("héllo")]
+
+    async def test_binary_round_trip(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.BINARY, b"\x00\xff"))
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [BinaryMessage(b"\x00\xff")]
+
+    async def test_server_frames_are_unmasked(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.TEXT, b"hi"))
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        frame_start = written.index(b"\r\n\r\n") + 4
+        assert written[frame_start + 1] & 0x80 == 0
+
+    async def test_prologue_frames_are_not_lost(self):
+        # Frames arriving in the same TCP segment as the handshake are already
+        # inside the HTTP parser's buffer when the upgrade is detected.
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE + client_frame(Opcode.TEXT, b"early"))
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [TextMessage("early")]
+
+    async def test_fragmented_client_message_is_reassembled(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(
+            client_frame(Opcode.TEXT, b"he", fin=False)
+            + client_frame(Opcode.CONTINUATION, b"llo")
+        )
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [TextMessage("hello")]
+
+    async def test_ping_is_answered_with_a_pong_the_app_never_sees(self):
+        received = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            while True:
+                message = await receive()
+                received.append(message["type"])
+                if message["type"] == "websocket.disconnect":
+                    return
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.PING, b"nonce"))
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [Pong(b"nonce")]
+        assert "websocket.receive" not in received
+
+
+class TestWebSocketClose:
+    async def test_client_close_is_echoed_and_the_app_sees_the_code(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            message = await receive()
+            codes.append(message["code"])
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(
+            client_frame(Opcode.CLOSE, struct.pack("!H", 1001) + b"bye")
+        )
+        await asyncio.sleep(0.05)
+        assert codes == [1001]
+        assert server_frames(transport) == [CloseReceived(1001, "bye")]
+        assert transport.closed is True
+
+    async def test_payloadless_client_close_reports_1005_and_echoes_empty(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.CLOSE, b""))
+        await asyncio.sleep(0.05)
+        assert codes == [1005]
+        # 1005 is never sendable, so the echo carries no payload either.
+        assert server_frames(transport) == [CloseReceived(1005, "")]
+
+    async def test_app_initiated_close(self):
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.close", "code": 1001, "reason": "later"})
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [CloseReceived(1001, "later")]
+        assert transport.closed is True
+
+    async def test_close_after_close_is_a_no_op(self):
+        # `finally: await ws.close()` is the commonest idiom there is and must
+        # not explode because the peer went first.
+        errors = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            try:
+                await send({"type": "websocket.close"})
+                await send({"type": "websocket.close"})
+            except Exception as exc:
+                errors.append(exc)
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert errors == []
+
+    async def test_handler_returning_without_closing_sends_1000(self):
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert server_frames(transport) == [CloseReceived(1000, "")]
+        assert transport.closed is True
+
+    async def test_codec_violation_closes_with_the_codec_code(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(encode_frame(Opcode.TEXT, b"unmasked"))
+        await asyncio.sleep(0.05)
+        assert codes == [1002]
+        closes = server_frames(transport)
+        assert [c.code for c in closes] == [1002]
+
+    async def test_oversized_message_closes_with_1009(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+
+        protocol, transport = make_protocol(app, websocket_max_message_size=10)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.BINARY, b"x" * 50))
+        await asyncio.sleep(0.05)
+        assert codes == [1009]
+        assert [c.code for c in server_frames(transport)] == [1009]
+
+    async def test_transport_loss_reports_1006(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.connection_lost(None)
+        await asyncio.sleep(0.05)
+        assert codes == [1006]
+
+    async def test_a_clean_close_is_not_overwritten_by_1006(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+            # A second receive must repeat the disconnect rather than hang.
+            codes.append((await receive())["code"])
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.CLOSE, struct.pack("!H", 1000)))
+        protocol.connection_lost(None)
+        await asyncio.sleep(0.05)
+        assert codes == [1000, 1000]
+
+
+class TestWebSocketSendErrors:
+    async def test_send_before_accept(self):
+        errors = []
+
+        async def app(scope, receive, send):
+            await receive()
+            try:
+                await send({"type": "websocket.send", "text": "too early"})
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert errors
+        assert "before websocket.accept" in errors[0]
+
+    async def test_accept_twice(self):
+        errors = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            try:
+                await send({"type": "websocket.accept"})
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert errors
+        assert "more than once" in errors[0]
+
+    async def test_send_without_text_or_bytes(self):
+        errors = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            try:
+                await send({"type": "websocket.send"})
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert errors
+        assert "'bytes' or 'text'" in errors[0]
+
+    async def test_http_message_on_a_websocket(self):
+        errors = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            try:
+                await send({"type": "http.response.start", "status": 200})
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        protocol, _ = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert errors
+        assert "unexpected ASGI message type" in errors[0]
+
+
+class TestWebSocketBackpressure:
+    async def test_reading_is_paused_until_accept(self):
+        started = asyncio.Event()
+
+        async def app(scope, receive, send):
+            await receive()
+            started.set()
+            await asyncio.sleep(0.2)
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert transport.paused is True
+
+    async def test_reading_resumes_on_accept(self):
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert transport.paused is False

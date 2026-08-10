@@ -21,13 +21,17 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
+from sonix.server.parser import DEFAULT_UPGRADE_PROTOCOLS
 from sonix.server.protocol import (
     DEFAULT_BODY_PAUSE_WATERMARK,
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
+    DEFAULT_WS_PAUSE_WATERMARK,
+    DEFAULT_WS_RESUME_WATERMARK,
     HTTPProtocol,
     ServerState,
 )
+from sonix.server.websockets import DEFAULT_MAX_MESSAGE_SIZE
 from sonix.types import ASGIApp, Message, Scope
 
 DEFAULT_HOST = "127.0.0.1"
@@ -173,6 +177,18 @@ class Config:
     body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK
     body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK
 
+    # WebSocket limits. websocket_max_message_size is the real DoS defense
+    # for a websocket connection -- an over-limit message is refused with
+    # close code 1009 rather than buffered without bound.
+    websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE
+    ws_pause_watermark: int = DEFAULT_WS_PAUSE_WATERMARK
+    ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK
+
+    # Which Upgrade offers actually switch the connection off HTTP. Empty
+    # disables upgrades entirely, and any offer not listed is answered as an
+    # ordinary HTTP request.
+    upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS
+
     # How long shutdown waits for in-flight requests before forcing sockets
     # closed. A deadline rather than an unbounded wait: a hung handler must
     # not be able to prevent the process from exiting.
@@ -195,6 +211,10 @@ class Config:
             head_timeout=self.head_timeout,
             body_pause_watermark=self.body_pause_watermark,
             body_resume_watermark=self.body_resume_watermark,
+            websocket_max_message_size=self.websocket_max_message_size,
+            ws_pause_watermark=self.ws_pause_watermark,
+            ws_resume_watermark=self.ws_resume_watermark,
+            upgrade_protocols=self.upgrade_protocols,
             server_state=state,
             state=lifespan_state,
         )
@@ -256,6 +276,15 @@ class Server:
         # Tells in-flight responses to advertise Connection: close, so clients
         # stop reusing sockets we are about to drop.
         self.state.should_exit = True
+
+        # WebSockets first, and actively. A websocket connection is never
+        # idle, so leaving it to the drain below would burn the whole deadline
+        # and then hand the client a bare TCP close (1006) instead of a close
+        # frame. Telling it to go away lets the handler observe a disconnect
+        # and return within a tick, so the drain finishes immediately.
+        for connection in list(self.state.connections):
+            if connection.is_websocket:
+                connection.shutdown_websocket()
 
         # Idle keep-alive connections are holding nothing; close them now
         # rather than waiting out the deadline for connections with no work.

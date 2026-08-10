@@ -8,6 +8,7 @@ import os
 import signal
 
 import pytest
+from wsclient import WSTestClient
 
 from sonix import DEFAULT_TARGET, Sonix, _parse_args, import_from_string, main
 from sonix.server.protocol import HTTPProtocol
@@ -454,3 +455,47 @@ class TestImportFromString:
     def test_non_callable_target_rejected(self):
         with pytest.raises(ValueError, match="not callable"):
             import_from_string("sonix:DEFAULT_TARGET")
+
+
+async def raw_ws_echo(scope: Scope, receive: Receive, send: Send) -> None:
+    if scope["type"] != "websocket":
+        return
+    await receive()
+    await send({"type": "websocket.accept"})
+    while True:
+        message = await receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        await send({"type": "websocket.send", "text": message["text"]})
+
+
+class TestWebSocketOverARealSocket:
+    async def test_round_trip(self):
+        server, host, port = await running(Config(raw_ws_echo, port=0))
+        try:
+            async with await WSTestClient.connect(host, port) as client:
+                await client.send_text("hello")
+                assert await client.receive_text() == "hello"
+        finally:
+            await server.shutdown()
+
+    async def test_shutdown_closes_a_live_websocket_with_1001(self):
+        # The is_idle regression guard. A websocket connection is never idle,
+        # so without shutdown_websocket() this waits out the full deadline and
+        # then hands the client a bare TCP close.
+        server, host, port = await running(
+            Config(raw_ws_echo, port=0, shutdown_timeout=5.0)
+        )
+        async with await WSTestClient.connect(host, port) as client:
+            await client.send_text("hi")
+            assert await client.receive_text() == "hi"
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await asyncio.wait_for(server.shutdown(), timeout=3)
+            elapsed = loop.time() - started
+
+            close = await asyncio.wait_for(client.receive_close(), timeout=2)
+            assert close.code == 1001
+            # Comfortably inside shutdown_timeout: it did not drain, it closed.
+            assert elapsed < 2.0
