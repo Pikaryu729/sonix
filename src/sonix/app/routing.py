@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sonix.app.responses import PlainTextResponse
+from sonix.app.exceptions import HTTPException
 from sonix.types import ASGIApp, Receive, Scope, Send
 
 
@@ -163,12 +163,12 @@ class Router:
             await route.handler(scope, receive, send)
             return
 
+        # Raised rather than returned, so that a custom 404 or 405 is a matter
+        # of registering an exception handler. Constructing the response here
+        # made these two statuses the only ones in the framework with no
+        # override hook. It does mean Router is not a complete ASGI app on its
+        # own -- it expects the ExceptionMiddleware that Sonix always wraps it
+        # in.
         if allowed:
-            response = PlainTextResponse(
-                "Method Not Allowed",
-                status_code=405,
-                headers={"allow": ", ".join(allowed)},
-            )
-        else:
-            response = PlainTextResponse("Not Found", status_code=404)
-        await response(scope, receive, send)
+            raise HTTPException(405, headers={"allow": ", ".join(allowed)})
+        raise HTTPException(404)

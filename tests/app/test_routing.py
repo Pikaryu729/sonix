@@ -3,6 +3,7 @@ import uuid
 import pytest
 from helpers import fake_receive, make_scope, make_send
 
+from sonix.app.exceptions import HTTPException
 from sonix.app.responses import PlainTextResponse
 from sonix.app.routing import CONVERTERS, RoutePathError, Router, compile_path
 
@@ -150,16 +151,18 @@ class TestRouterMatching:
     async def test_trailing_slash_is_strict(self):
         router = Router()
         router.add_route("/items", ok_handler())
-        send, sent = make_send()
-        await router(make_scope(path="/items/"), fake_receive, send)
-        assert sent[0]["status"] == 404
+        send, _sent = make_send()
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/items/"), fake_receive, send)
+        assert excinfo.value.status_code == 404
 
     async def test_trailing_slash_is_strict_other_direction(self):
         router = Router()
         router.add_route("/items/", ok_handler())
-        send, sent = make_send()
-        await router(make_scope(path="/items"), fake_receive, send)
-        assert sent[0]["status"] == 404
+        send, _sent = make_send()
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/items"), fake_receive, send)
+        assert excinfo.value.status_code == 404
 
     async def test_registration_order_precedence(self):
         calls = []
@@ -185,33 +188,37 @@ class TestRouterMatching:
 
 
 class TestNotFound:
-    async def test_no_matching_route_returns_404(self):
+    async def test_no_matching_route_raises_404(self):
+        # Raised, not returned: that is what makes a custom 404 a matter of
+        # registering an exception handler. ExceptionMiddleware converts it.
         router = Router()
         router.add_route("/items", ok_handler())
-        send, sent = make_send()
-        await router(make_scope(path="/nope"), fake_receive, send)
-        assert sent[0]["status"] == 404
-        header_names = [name for name, _ in sent[0]["headers"]]
-        assert b"allow" not in header_names
+        send, _sent = make_send()
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/nope"), fake_receive, send)
+        assert excinfo.value.status_code == 404
+        assert excinfo.value.headers is None
 
 
 class TestMethodNotAllowed:
     async def test_single_route_wrong_method(self):
         router = Router()
         router.add_route("/items", ok_handler(), methods=["GET"])
-        send, sent = make_send()
-        await router(make_scope(path="/items", method="POST"), fake_receive, send)
-        assert sent[0]["status"] == 405
-        assert (b"allow", b"GET") in sent[0]["headers"]
+        send, _sent = make_send()
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/items", method="POST"), fake_receive, send)
+        assert excinfo.value.status_code == 405
+        assert excinfo.value.headers == {"allow": "GET"}
 
     async def test_allow_header_is_scan_order_union(self):
         router = Router()
         router.add_route("/items", ok_handler(), methods=["GET"])
         router.add_route("/items", ok_handler(), methods=["POST"])
-        send, sent = make_send()
-        await router(make_scope(path="/items", method="DELETE"), fake_receive, send)
-        assert sent[0]["status"] == 405
-        assert (b"allow", b"GET, POST") in sent[0]["headers"]
+        send, _sent = make_send()
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/items", method="DELETE"), fake_receive, send)
+        assert excinfo.value.status_code == 405
+        assert excinfo.value.headers == {"allow": "GET, POST"}
 
     async def test_later_route_with_right_method_is_dispatched_not_405(self):
         calls = []

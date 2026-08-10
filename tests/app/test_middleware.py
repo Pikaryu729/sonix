@@ -287,6 +287,58 @@ class TestCustomHandlers:
         assert seen["exc"].detail == "detail here"
 
 
+class TestRouterErrorsAreOverridable:
+    """404/405 used to be hardcoded PlainTextResponses inside Router with no
+    hook -- the only two statuses in the framework a user could not change."""
+
+    async def test_404_still_reaches_the_client_by_default(self):
+        app = Sonix()
+        send, sent = make_send()
+        await app(make_scope(path="/nope"), fake_receive, send)
+        assert sent[0]["status"] == 404
+
+    async def test_405_still_carries_its_allow_header(self):
+        app = Sonix()
+
+        @app.get("/items")
+        def handler(request: Request):
+            return "ok"
+
+        send, sent = make_send()
+        await app(make_scope(path="/items", method="POST"), fake_receive, send)
+        assert sent[0]["status"] == 405
+        assert (b"allow", b"GET") in sent[0]["headers"]
+
+    async def test_404_can_be_customized(self):
+        app = Sonix()
+
+        @app.exception_handler(404)
+        async def not_found(request: Request, exc: Exception):
+            return PlainTextResponse("nothing here, sorry", status_code=404)
+
+        send, sent = make_send()
+        await app(make_scope(path="/nope"), fake_receive, send)
+        assert sent[1]["body"] == b"nothing here, sorry"
+
+    async def test_custom_405_can_still_read_the_allow_header(self):
+        app = Sonix()
+
+        @app.exception_handler(405)
+        async def method_not_allowed(request: Request, exc: Exception):
+            assert isinstance(exc, HTTPException)
+            return PlainTextResponse(
+                "try one of these", status_code=405, headers=exc.headers
+            )
+
+        @app.get("/items")
+        def handler(request: Request):
+            return "ok"
+
+        send, sent = make_send()
+        await app(make_scope(path="/items", method="DELETE"), fake_receive, send)
+        assert (b"allow", b"GET") in sent[0]["headers"]
+
+
 class TestStackLifecycle:
     async def test_stack_is_built_once_and_reused(self):
         app = Sonix()
