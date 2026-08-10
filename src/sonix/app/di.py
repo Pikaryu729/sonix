@@ -9,7 +9,8 @@ functions here rather than one clever wrapper.
 Two orderings matter, and they are not the same thing.
 
 **Classification precedence**, decided once per parameter at decoration time:
-``Depends`` > special type (``Request``) > path parameter > query parameter.
+``Depends`` > the connection object (``Request`` on an HTTP route,
+``WebSocket`` on a websocket one) > path parameter > query parameter.
 
 **Execution order**, per request: *every* scalar in the whole dependency
 graph is resolved and coerced first, collecting every failure, and a 422 is
@@ -37,8 +38,9 @@ from dataclasses import dataclass
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from sonix.app.exceptions import ValidationError
-from sonix.app.requests import Request
+from sonix.app.requests import HTTPConnection, Request
 from sonix.app.routing import Converter
+from sonix.app.websockets import WebSocket
 
 
 class DependencyResolutionError(Exception):
@@ -211,7 +213,7 @@ class DependencySpec:
 @dataclass(frozen=True, slots=True)
 class Param:
     name: str
-    # "request" | "path" | "query" | "depends"
+    # "connection" | "path" | "query" | "depends"
     source: str
     query: QuerySpec | None = None
     dependency: DependencySpec | None = None
@@ -250,14 +252,41 @@ def _any_teardown(params: tuple[Param, ...]) -> bool:
     return False
 
 
+@dataclass(frozen=True, slots=True)
+class _Connection:
+    """The connection object injectable into one kind of route.
+
+    ``name`` is the parameter name that resolves it without an annotation --
+    the fallback that keeps pre-DI `def handler(request)` handlers working,
+    and its websocket equivalent.
+    """
+
+    cls: type[HTTPConnection]
+    name: str
+
+
+_CONNECTIONS = {
+    "http": _Connection(Request, "request"),
+    "websocket": _Connection(WebSocket, "websocket"),
+}
+_OTHER = {"http": "websocket", "websocket": "http"}
+
+
 def build_plan(
     call: Callable[..., Any],
     *,
     path_converters: dict[str, Converter] | None = None,
     where: str | None = None,
+    scope_type: str = "http",
     _seen: frozenset[int] = frozenset(),
 ) -> Plan:
-    """Inspect ``call`` once and describe how to satisfy each parameter."""
+    """Inspect ``call`` once and describe how to satisfy each parameter.
+
+    ``scope_type`` decides which connection object is injectable: a Request
+    on an HTTP route, a WebSocket on a websocket one. Passing it means
+    declaring the wrong one is a decoration-time error rather than an
+    AttributeError on the first request.
+    """
     path_converters = path_converters or {}
     label = where or getattr(call, "__name__", repr(call))
 
@@ -308,7 +337,7 @@ def build_plan(
                     name=name,
                     source="depends",
                     dependency=_build_dependency(
-                        marker, path_converters, _seen | {id(call)}
+                        marker, path_converters, scope_type, _seen | {id(call)}
                     ),
                 )
             )
@@ -316,7 +345,15 @@ def build_plan(
 
         base, _metadata = _unwrap_annotated(annotation)
 
-        if base is Request or (base is None and name == "request"):
+        wanted, other = _CONNECTIONS[scope_type], _CONNECTIONS[_OTHER[scope_type]]
+        if base is other.cls:
+            # Caught here rather than at request time, where it would surface
+            # as a mystifying AttributeError deep inside a handler.
+            raise DependencyResolutionError(
+                f"{label}({name}: {other.cls.__name__}) cannot be injected "
+                f"into a {scope_type} route -- use {wanted.cls.__name__}"
+            )
+        if base is wanted.cls or (base is None and name == wanted.name):
             # The unannotated spelling is not a nicety: handlers written
             # before DI existed say `def handler(request):`, and without this
             # they would fall through to "required str query parameter" and
@@ -324,10 +361,17 @@ def build_plan(
             if name in path_converters:
                 raise DependencyResolutionError(
                     f"{label}({name}) is both a path parameter in the route "
-                    f"template and the injected Request. Rename one."
+                    f"template and the injected {wanted.cls.__name__}. "
+                    "Rename one."
                 )
-            params.append(Param(name=name, source="request"))
+            params.append(Param(name=name, source="connection"))
             continue
+        if base is None and name == other.name:
+            raise DependencyResolutionError(
+                f"{label}({name}) is unannotated on a {scope_type} route, so "
+                f"it reads as a query parameter. Name it {wanted.name!r} or "
+                f"annotate it {wanted.cls.__name__}."
+            )
 
         if name in path_converters:
             _check_path_annotation(label, name, base, path_converters[name])
@@ -347,7 +391,7 @@ def build_plan(
         params=frozen,
         query_specs=_flatten_query_specs(frozen),
         needs_teardown=_any_teardown(frozen),
-        is_trivial=len(frozen) == 1 and frozen[0].source == "request",
+        is_trivial=len(frozen) == 1 and frozen[0].source == "connection",
     )
 
 
@@ -415,13 +459,19 @@ def _build_query_spec(
 def _build_dependency(
     marker: Depends,
     path_converters: dict[str, Converter],
+    scope_type: str,
     seen: frozenset[int],
 ) -> DependencySpec:
     call = marker.dependency
     target = _target_function(call)
     return DependencySpec(
         call=call,
-        plan=build_plan(call, path_converters=path_converters, _seen=seen),
+        plan=build_plan(
+            call,
+            path_converters=path_converters,
+            scope_type=scope_type,
+            _seen=seen,
+        ),
         use_cache=marker.use_cache,
         is_async=inspect.iscoroutinefunction(target),
         is_async_gen=inspect.isasyncgenfunction(target),
@@ -452,8 +502,8 @@ def _convert(spec: QuerySpec, raw: str) -> Any:
         ) from exc
 
 
-def _resolve_query(spec: QuerySpec, request: Request) -> Any:
-    params = request.query_params
+def _resolve_query(spec: QuerySpec, connection: HTTPConnection) -> Any:
+    params = connection.query_params
 
     if spec.is_list:
         raw_values = params.get_list(spec.name)
@@ -485,7 +535,7 @@ def _resolve_query(spec: QuerySpec, request: Request) -> Any:
     return _convert(spec, raw_value)
 
 
-def _resolve_all_scalars(plan: Plan, request: Request) -> dict[int, Any]:
+def _resolve_all_scalars(plan: Plan, connection: HTTPConnection) -> dict[int, Any]:
     """Pass one: every query parameter in the graph, all errors at once.
 
     Runs before any dependency callable, so a malformed query string can never
@@ -496,7 +546,7 @@ def _resolve_all_scalars(plan: Plan, request: Request) -> dict[int, Any]:
     errors: list[dict] = []
     for spec in plan.query_specs:
         try:
-            values[id(spec)] = _resolve_query(spec, request)
+            values[id(spec)] = _resolve_query(spec, connection)
         except ValidationError as exc:
             errors.extend(exc.errors)
     if errors:
@@ -531,7 +581,7 @@ async def _call_dependency(
 
 async def _resolve_dependency(
     spec: DependencySpec,
-    request: Request,
+    connection: HTTPConnection,
     stack: contextlib.AsyncExitStack | None,
     scalars: dict[int, Any],
     cache: dict[int, Any],
@@ -539,7 +589,7 @@ async def _resolve_dependency(
     key = id(spec.call)
     if spec.use_cache and key in cache:
         return cache[key]
-    kwargs = await _resolve_params(spec.plan, request, stack, scalars, cache)
+    kwargs = await _resolve_params(spec.plan, connection, stack, scalars, cache)
     value = await _call_dependency(spec, kwargs, stack)
     if spec.use_cache:
         cache[key] = value
@@ -548,7 +598,7 @@ async def _resolve_dependency(
 
 async def _resolve_params(
     plan: Plan,
-    request: Request,
+    connection: HTTPConnection,
     stack: contextlib.AsyncExitStack | None,
     scalars: dict[int, Any],
     cache: dict[int, Any],
@@ -556,30 +606,36 @@ async def _resolve_params(
     """Pass two: assemble kwargs, invoking dependency callables as needed."""
     kwargs: dict[str, Any] = {}
     for param in plan.params:
-        if param.source == "request":
-            kwargs[param.name] = request
+        if param.source == "connection":
+            kwargs[param.name] = connection
         elif param.source == "path":
-            kwargs[param.name] = request.path_params[param.name]
+            kwargs[param.name] = connection.path_params[param.name]
         elif param.source == "query":
             assert param.query is not None
             kwargs[param.name] = scalars[id(param.query)]
         else:
             assert param.dependency is not None
             kwargs[param.name] = await _resolve_dependency(
-                param.dependency, request, stack, scalars, cache
+                param.dependency, connection, stack, scalars, cache
             )
     return kwargs
 
 
 async def resolve(
     plan: Plan,
-    request: Request,
+    connection: HTTPConnection,
     stack: contextlib.AsyncExitStack | None = None,
 ) -> dict[str, Any]:
-    """Execute a plan against one request. No introspection happens here."""
+    """Execute a plan against one connection. No introspection happens here.
+
+    Typed against HTTPConnection rather than Request because resolution only
+    ever reads query_params and path_params -- the surface a WebSocket shares
+    -- so a websocket handler gets path and query injection with no branch
+    anywhere in this module.
+    """
     if plan.is_trivial:
         # The pre-DI convention. Skipped straight through so adding DI costs
         # existing handlers nothing measurable.
-        return {plan.params[0].name: request}
-    scalars = _resolve_all_scalars(plan, request)
-    return await _resolve_params(plan, request, stack, scalars, {})
+        return {plan.params[0].name: connection}
+    scalars = _resolve_all_scalars(plan, connection)
+    return await _resolve_params(plan, connection, stack, scalars, {})

@@ -1,10 +1,11 @@
-"""Sonix: the app class and @app.get/@app.post/... decorators.
+"""Sonix: the app class and @app.get/@app.post/@app.websocket decorators.
 
-No DI yet (that is a later milestone) -- a registered handler always takes
-exactly one argument, a Request, mirroring the calling convention frameworks
-like Starlette started with before adding signature-based dependency
-injection on top. A sync handler runs via asyncio.to_thread so it never
-blocks the event loop; that behavior is independent of DI.
+A handler declares whatever parameters it needs and app/di.py builds the plan
+to satisfy them, once, at decoration time. The pre-DI convention -- a single
+Request argument -- still works, as the degenerate case of that. A sync HTTP
+handler runs via asyncio.to_thread so it never blocks the event loop; a sync
+*websocket* handler is refused outright, since every WebSocket method is a
+coroutine and a worker thread could not await one.
 
 Middleware composition lives in app/middleware.py; this module owns the
 registration lists and decides when the stack gets built -- once, on the
@@ -35,6 +36,7 @@ from sonix.app.middleware import (
 from sonix.app.requests import Request
 from sonix.app.responses import JSONResponse, PlainTextResponse, Response
 from sonix.app.routing import Router, compile_path
+from sonix.app.websockets import WebSocket
 from sonix.types import ASGIApp, Receive, Scope, Send
 
 # Callable[..., Any] rather than Callable[[Request], Any]: since DI landed a
@@ -108,6 +110,34 @@ def _endpoint(handler: Handler, path: str) -> ASGIApp:
         # a subtle and infuriating bug.
         async with contextlib.AsyncExitStack() as stack:
             await run(request, stack, scope, receive, send)
+
+    return endpoint
+
+
+def _ws_endpoint(handler: Handler, path: str) -> ASGIApp:
+    if not _is_coroutine_callable(handler):
+        # Not a stylistic preference. A sync handler runs in
+        # asyncio.to_thread, and every method on WebSocket is a coroutine --
+        # so such a handler could do nothing whatsoever with its only
+        # argument. A sync HTTP handler at least computes and returns a value.
+        name = getattr(handler, "__name__", repr(handler))
+        raise TypeError(
+            f"websocket handler {name!r} must be async: every WebSocket "
+            f"method is a coroutine, so a sync handler run in a worker "
+            f"thread could not await a single one of them"
+        )
+    _pattern, path_converters = compile_path(path)
+    plan = build_plan(handler, path_converters=path_converters, scope_type="websocket")
+
+    async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
+        websocket = WebSocket(scope, receive, send)
+        # No _coerce_response tail: a websocket handler's return value is
+        # meaningless -- returning is simply how a session ends.
+        if not plan.needs_teardown:
+            await handler(**await resolve(plan, websocket, None))
+            return
+        async with contextlib.AsyncExitStack() as stack:
+            await handler(**await resolve(plan, websocket, stack))
 
     return endpoint
 
@@ -210,6 +240,18 @@ class Sonix:
         self, path: str, handler: Handler, methods: list[str] | None = None
     ) -> None:
         self.router.add_route(path, _endpoint(handler, path), methods=methods)
+
+    def websocket(self, path: str) -> Callable[[Handler], Handler]:
+        """Register a websocket handler. Shares the path space with HTTP."""
+
+        def decorator(handler: Handler) -> Handler:
+            self.add_websocket_route(path, handler)
+            return handler
+
+        return decorator
+
+    def add_websocket_route(self, path: str, handler: Handler) -> None:
+        self.router.add_websocket_route(path, _ws_endpoint(handler, path))
 
     def get(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, methods=["GET"])

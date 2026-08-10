@@ -16,7 +16,7 @@ import uuid
 from typing import Annotated
 
 import pytest
-from helpers import fake_receive, make_scope, make_send
+from helpers import fake_receive, make_receive, make_scope, make_send, make_ws_scope
 
 from sonix.app.applications import Sonix
 from sonix.app.di import (
@@ -29,6 +29,7 @@ from sonix.app.di import (
 from sonix.app.exceptions import HTTPException
 from sonix.app.requests import Request
 from sonix.app.routing import CONVERTERS, compile_path
+from sonix.app.websockets import WebSocket
 
 
 def plan_for(handler, path: str = "/"):
@@ -59,12 +60,12 @@ class TestPlanShape:
 
         plan = plan_for(handler)
         assert plan.is_trivial
-        assert plan.params[0].source == "request"
+        assert plan.params[0].source == "connection"
 
     def test_request_is_matched_by_annotation_not_name(self):
         def handler(req: Request): ...
 
-        assert plan_for(handler).params[0].source == "request"
+        assert plan_for(handler).params[0].source == "connection"
 
     def test_path_parameter_is_classified_as_path(self):
         def handler(item_id: int): ...
@@ -916,3 +917,174 @@ class TestResolveDirectly:
 
         await asyncio.gather(run(app), run(app))
         assert len(calls) == 2
+
+
+def ws_plan_for(handler, path: str = "/ws"):
+    _pattern, converters = compile_path(path)
+    return build_plan(handler, path_converters=converters, scope_type="websocket")
+
+
+class TestWebSocketInjection:
+    def test_websocket_is_the_trivial_plan_on_a_websocket_route(self):
+        async def handler(websocket: WebSocket): ...
+
+        plan = ws_plan_for(handler)
+        assert plan.is_trivial
+        assert plan.params[0].source == "connection"
+
+    def test_unannotated_websocket_name_resolves(self):
+        async def handler(websocket): ...
+
+        assert ws_plan_for(handler).is_trivial
+
+    def test_websocket_matched_by_annotation_not_name(self):
+        async def handler(ws: WebSocket): ...
+
+        assert ws_plan_for(handler).params[0].source == "connection"
+
+    def test_path_and_query_are_injectable_into_a_websocket_handler(self):
+        async def handler(websocket: WebSocket, room: int, token: str = "anon"): ...
+
+        plan = ws_plan_for(handler, "/rooms/{room:int}")
+        assert [p.source for p in plan.params] == ["connection", "path", "query"]
+
+    async def test_resolution_reads_the_websocket_scope(self):
+        seen = {}
+
+        async def handler(websocket: WebSocket, room: int, tag: list[str]):
+            seen["ws"] = websocket
+            seen["room"] = room
+            seen["tag"] = tag
+
+        plan = ws_plan_for(handler, "/rooms/{room:int}")
+        send, _ = make_send()
+        websocket = WebSocket(
+            make_ws_scope(path="/rooms/7", query_string=b"tag=a&tag=b"),
+            fake_receive,
+            send,
+        )
+        websocket.scope["path_params"] = {"room": 7}
+        await handler(**await resolve(plan, websocket))
+        assert seen["room"] == 7
+        assert seen["tag"] == ["a", "b"]
+        assert seen["ws"] is websocket
+
+    async def test_a_bad_query_parameter_is_still_a_422(self):
+        # The exception layer turns this into a close(1008); what matters here
+        # is that the same validation runs on a websocket route at all.
+        async def handler(websocket: WebSocket, limit: int): ...
+
+        plan = ws_plan_for(handler)
+        send, _ = make_send()
+        websocket = WebSocket(
+            make_ws_scope(query_string=b"limit=abc"), fake_receive, send
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await resolve(plan, websocket)
+        assert excinfo.value.status_code == 422
+
+    def test_request_on_a_websocket_route_is_a_decoration_error(self):
+        async def handler(request: Request): ...
+
+        with pytest.raises(DependencyResolutionError, match="use WebSocket"):
+            ws_plan_for(handler)
+
+    def test_websocket_on_an_http_route_is_a_decoration_error(self):
+        def handler(websocket: WebSocket): ...
+
+        with pytest.raises(DependencyResolutionError, match="use Request"):
+            plan_for(handler)
+
+    def test_unannotated_request_on_a_websocket_route_is_a_decoration_error(self):
+        # Without this arm it would silently classify as a required string
+        # query parameter and 422 on every connection.
+        async def handler(request): ...
+
+        with pytest.raises(DependencyResolutionError, match="Name it 'websocket'"):
+            ws_plan_for(handler)
+
+    def test_unannotated_websocket_on_an_http_route_is_a_decoration_error(self):
+        def handler(websocket): ...
+
+        with pytest.raises(DependencyResolutionError, match="Name it 'request'"):
+            plan_for(handler)
+
+    def test_scope_type_threads_through_dependencies(self):
+        async def bad_dependency(request: Request): ...
+
+        async def handler(value: Annotated[str, Depends(bad_dependency)]): ...
+
+        with pytest.raises(DependencyResolutionError, match="use WebSocket"):
+            ws_plan_for(handler)
+
+    def test_websocket_colliding_with_a_path_parameter_is_rejected(self):
+        async def handler(websocket: WebSocket): ...
+
+        with pytest.raises(DependencyResolutionError, match="Rename one"):
+            ws_plan_for(handler, "/{websocket}")
+
+
+class TestWebSocketRouteRegistration:
+    async def test_app_websocket_decorator_dispatches(self):
+        app = Sonix()
+        seen = []
+
+        @app.websocket("/ws/{room:int}")
+        async def handler(websocket: WebSocket, room: int):
+            seen.append(room)
+            await websocket.accept()
+            await websocket.close()
+
+        send, sent = make_send()
+        await app(
+            make_ws_scope(path="/ws/3"),
+            make_receive([{"type": "websocket.connect"}]),
+            send,
+        )
+        assert seen == [3]
+        assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+
+    def test_sync_websocket_handler_is_rejected_at_decoration(self):
+        app = Sonix()
+
+        with pytest.raises(TypeError, match="must be async"):
+
+            @app.websocket("/ws")
+            def handler(websocket): ...
+
+    async def test_generator_dependency_teardown_runs(self):
+        app = Sonix()
+        events = []
+
+        async def resource():
+            events.append("open")
+            try:
+                yield "db"
+            finally:
+                events.append("close")
+
+        @app.websocket("/ws")
+        async def handler(websocket: WebSocket, db: Annotated[str, Depends(resource)]):
+            events.append(db)
+            await websocket.accept()
+
+        send, _ = make_send()
+        await app(
+            make_ws_scope(),
+            make_receive([{"type": "websocket.connect"}]),
+            send,
+        )
+        assert events == ["open", "db", "close"]
+
+    async def test_an_unmatched_websocket_path_closes_rather_than_404s(self):
+        app = Sonix()
+
+        @app.websocket("/ws")
+        async def handler(websocket: WebSocket):
+            await websocket.accept()
+
+        send, sent = make_send()
+        await app(make_ws_scope(path="/nope"), fake_receive, send)
+        assert sent == [
+            {"type": "websocket.close", "code": 1000, "reason": sent[0]["reason"]}
+        ]
