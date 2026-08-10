@@ -22,9 +22,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from sonix.app.exceptions import HTTPException
+from sonix.app.exceptions import HTTPException, ValidationError
 from sonix.app.requests import ClientDisconnect, Request
-from sonix.app.responses import PlainTextResponse, Response
+from sonix.app.responses import JSONResponse, PlainTextResponse, Response
 from sonix.types import ASGIApp, Message, Receive, Scope, Send
 
 ExceptionHandler = Callable[[Request, Exception], Awaitable[Response]]
@@ -60,6 +60,13 @@ async def http_exception_handler(request: Request, exc: Exception) -> Response:
     )
 
 
+async def validation_error_handler(request: Request, exc: Exception) -> Response:
+    assert isinstance(exc, ValidationError)
+    # JSON rather than plain text: this is the one error a client is expected
+    # to act on programmatically, and it carries a list rather than a sentence.
+    return JSONResponse({"detail": exc.errors}, status_code=exc.status_code)
+
+
 async def server_error_handler(request: Request, exc: Exception) -> Response:
     # Deliberately says nothing about the underlying exception: the traceback
     # goes to the log, not to the client.
@@ -85,6 +92,9 @@ class ExceptionMiddleware:
         self.app = app
         self.debug = debug
         self._handlers: dict[HandlerKey, ExceptionHandler] = {
+            # ValidationError is an HTTPException subclass; _lookup walks the
+            # MRO, so this more specific entry wins over the generic one.
+            ValidationError: validation_error_handler,
             HTTPException: http_exception_handler,
             Exception: server_error_handler,
         }

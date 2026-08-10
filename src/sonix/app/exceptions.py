@@ -46,3 +46,32 @@ class HTTPException(Exception):
             f"{type(self).__name__}(status_code={self.status_code!r}, "
             f"detail={self.detail!r})"
         )
+
+
+class ValidationError(HTTPException):
+    """A 422 carrying one entry per parameter that failed.
+
+    A plain HTTPException would flatten this to a single string, but a client
+    fixing a request wants every problem at once rather than discovering them
+    one round trip at a time. Each entry is
+    ``{"loc": [source, name], "msg": ..., "type": ...}`` -- the same shape
+    FastAPI uses, which is worth matching for no reason other than that
+    consumers already know how to read it.
+
+    Subclassing HTTPException is what makes this work with the existing
+    machinery: ExceptionMiddleware walks the MRO, so a registered
+    ValidationError handler wins, and `debug=True` (which re-raises only
+    non-HTTPException errors) correctly still converts it -- a 422 is a
+    client mistake, not a bug to surface.
+    """
+
+    def __init__(self, errors: list[dict]) -> None:
+        self.errors = list(errors)
+        # str detail is still populated so that anything reading a plain
+        # HTTPException -- a custom handler, a log line -- gets something
+        # useful rather than an empty string.
+        summary = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in self.errors
+        )
+        super().__init__(422, summary or status_phrase(422))
