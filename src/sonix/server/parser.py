@@ -140,6 +140,27 @@ class HTTP11Parser:
         """True once a request head switched the connection off HTTP."""
         return self._state is _State.UPGRADED
 
+    @property
+    def mid_request(self) -> bool:
+        """True when a request is partly received: not at a request boundary.
+
+        Exists so a caller can tell "this connection is idle between requests"
+        from "a request head is being dripped in one byte at a time". Those
+        are two different conditions with two different right answers -- close
+        quietly, versus 408 -- and nothing else a caller can see separates
+        them.
+
+        Deliberately a predicate rather than a buffer accessor. Handing out
+        the buffer would let a caller reach its own conclusion about where a
+        request begins, which is the one thing this module exists to prevent.
+
+        Note both halves are load-bearing. A partial *head* leaves the state
+        at START_LINE with bytes buffered, so a state-only test would call
+        that idle -- and a state-only test is exactly the mistake that hands
+        a slow-loris client the more generous timeout.
+        """
+        return self._state is not _State.START_LINE or bool(self._buffer)
+
     def feed_data(self, data: bytes) -> list[Event]:
         if self._state is _State.UPGRADED:
             # Post-upgrade bytes belong to whatever protocol took over. Buffer
@@ -174,7 +195,7 @@ class HTTP11Parser:
             # An upgraded connection closing is not an incomplete request --
             # there is no request in flight, and never will be again.
             return
-        if self._state is not _State.START_LINE or self._buffer:
+        if self.mid_request:
             raise MalformedRequest("connection closed with an incomplete request")
 
     def take_buffer(self) -> bytes:

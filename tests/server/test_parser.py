@@ -705,3 +705,79 @@ class TestProtocolUpgrade:
         heads = [e for e in events if isinstance(e, RequestHeadComplete)]
         assert [h.head.path for h in heads] == ["/a", "/ws"]
         assert [h.head.upgrade for h in heads] == [None, "websocket"]
+
+
+class TestMidRequest:
+    """The predicate that separates "idle" from "a head is being dripped in".
+
+    Both are silent connections. Only one of them is an attack, and the
+    caller's answer differs -- so this is the whole basis of the connection
+    timeout's mode choice.
+    """
+
+    def test_a_fresh_parser_is_at_a_boundary(self):
+        assert parser().mid_request is False
+
+    def test_a_partial_start_line_counts(self):
+        # The arm a state-only check gets wrong: the state is still
+        # START_LINE, and only the buffer says a request has begun. This is
+        # exactly the slow-loris shape.
+        p = parser()
+        feed(p, b"GE")
+        assert p.mid_request is True
+
+    def test_partway_through_headers_counts(self):
+        p = parser()
+        feed(p, b"GET / HTTP/1.1\r\n")
+        assert p.mid_request is True
+
+    def test_a_complete_request_returns_to_a_boundary(self):
+        p = parser()
+        feed(p, b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        assert p.mid_request is False
+
+    def test_a_partly_received_body_counts(self):
+        p = parser()
+        feed(p, b"POST / HTTP/1.1\r\nHost: e.com\r\nContent-Length: 10\r\n\r\nhalf")
+        assert p.mid_request is True
+
+    def test_a_completed_chunked_body_returns_to_a_boundary(self):
+        p = parser()
+        feed(
+            p,
+            b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\n",
+        )
+        assert p.mid_request is False
+
+    def test_a_partial_request_pipelined_behind_a_complete_one_counts(self):
+        p = parser()
+        feed(p, b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\nGET /b HTT")
+        assert p.mid_request is True
+
+    def test_an_upgraded_parser_counts(self):
+        # There is no request boundary to be at once HTTP framing has stopped.
+        # No caller asks in this state -- the bridge stops feeding this parser
+        # at the upgrade -- and feed_eof checks UPGRADED before reaching here.
+        p = parser()
+        feed(p, HANDSHAKE)
+        assert p.mid_request is True
+
+    def test_feed_eof_agrees_with_the_predicate(self):
+        # feed_eof is written in terms of mid_request, so this pins that the
+        # de-duplication did not change its behaviour.
+        for data, raises in (
+            (b"", False),
+            (b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n", False),
+            (b"GET / HTTP/1.1\r\n", True),
+            (b"GE", True),
+        ):
+            p = parser()
+            if data:
+                feed(p, data)
+            assert p.mid_request is raises
+            if raises:
+                with pytest.raises(MalformedRequest):
+                    p.feed_eof()
+            else:
+                p.feed_eof()
