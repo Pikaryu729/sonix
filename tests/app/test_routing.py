@@ -1,9 +1,9 @@
 import uuid
 
 import pytest
-from helpers import fake_receive, make_scope, make_send
+from helpers import fake_receive, make_scope, make_send, make_ws_scope
 
-from sonix.app.exceptions import HTTPException
+from sonix.app.exceptions import HTTPException, WebSocketException
 from sonix.app.responses import PlainTextResponse
 from sonix.app.routing import CONVERTERS, RoutePathError, Router, compile_path
 
@@ -248,3 +248,78 @@ class TestPathParamsInScope:
         send, _sent = make_send()
         await router(make_scope(path="/items/7"), fake_receive, send)
         assert seen_scopes[0]["path_params"] == {"id": 7}
+
+
+class TestWebSocketRouting:
+    async def test_websocket_route_matches_and_binds_path_params(self):
+        seen = {}
+
+        async def handler(scope, receive, send):
+            seen.update(scope["path_params"])
+
+        router = Router()
+        router.add_websocket_route("/rooms/{room_id:int}", handler)
+        await router(make_ws_scope(path="/rooms/7"), fake_receive, make_send()[0])
+        assert seen == {"room_id": 7}
+
+    async def test_http_and_websocket_routes_share_a_path(self):
+        called = []
+
+        async def http_handler(scope, receive, send):
+            called.append("http")
+
+        async def ws_handler(scope, receive, send):
+            called.append("ws")
+
+        router = Router()
+        router.add_route("/x", http_handler)
+        router.add_websocket_route("/x", ws_handler)
+
+        send, _ = make_send()
+        await router(make_scope(path="/x"), fake_receive, send)
+        await router(make_ws_scope(path="/x"), fake_receive, send)
+        assert called == ["http", "ws"]
+
+    async def test_http_request_to_a_websocket_only_path_is_404_not_405(self):
+        # A 405 here would carry an empty Allow header, which is worse than
+        # useless -- it claims the path exists over HTTP with no usable method.
+        async def ws_handler(scope, receive, send):
+            raise AssertionError("must not be dispatched")
+
+        router = Router()
+        router.add_websocket_route("/ws", ws_handler)
+        with pytest.raises(HTTPException) as excinfo:
+            await router(make_scope(path="/ws"), fake_receive, make_send()[0])
+        assert excinfo.value.status_code == 404
+
+    async def test_websocket_to_an_http_only_path_raises_websocket_exception(self):
+        async def http_handler(scope, receive, send):
+            raise AssertionError("must not be dispatched")
+
+        router = Router()
+        router.add_route("/x", http_handler)
+        with pytest.raises(WebSocketException) as excinfo:
+            await router(make_ws_scope(path="/x"), fake_receive, make_send()[0])
+        assert excinfo.value.code == 1000
+
+    async def test_unmatched_websocket_path(self):
+        router = Router()
+        with pytest.raises(WebSocketException, match="no websocket route"):
+            await router(make_ws_scope(path="/nope"), fake_receive, make_send()[0])
+
+    async def test_websocket_routes_have_no_methods(self):
+        async def ws_handler(scope, receive, send):
+            pass
+
+        router = Router()
+        router.add_websocket_route("/ws", ws_handler)
+        assert router._routes[0].methods == ()
+        assert router._routes[0].scope_type == "websocket"
+
+    async def test_http_routes_default_to_the_http_scope_type(self):
+        async def handler(scope, receive, send):
+            pass
+
+        router = Router()
+        router.add_route("/x", handler)
+        assert router._routes[0].scope_type == "http"

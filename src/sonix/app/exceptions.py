@@ -48,6 +48,25 @@ class HTTPException(Exception):
         )
 
 
+class WebSocketException(Exception):
+    """Stop this websocket handler and close with this code.
+
+    Deliberately not an HTTPException subclass. A close code is not a status
+    code, and the handler registry walks the MRO -- so inheriting would hand
+    this to a handler that returns an HTTP Response, which is meaningless on
+    a websocket. 1008 (policy violation) is the closest thing RFC 6455 has to
+    "the application refused you".
+    """
+
+    def __init__(self, code: int = 1008, reason: str | None = None) -> None:
+        self.code = code
+        self.reason = reason or ""
+        super().__init__(f"{code}: {self.reason}" if self.reason else str(code))
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(code={self.code}, reason={self.reason!r})"
+
+
 class ValidationError(HTTPException):
     """A 422 carrying one entry per parameter that failed.
 

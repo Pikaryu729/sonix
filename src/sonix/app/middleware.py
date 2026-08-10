@@ -22,9 +22,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from sonix.app.exceptions import HTTPException, ValidationError
+from sonix.app.exceptions import HTTPException, ValidationError, WebSocketException
 from sonix.app.requests import ClientDisconnect, Request
 from sonix.app.responses import JSONResponse, PlainTextResponse, Response
+from sonix.app.websockets import WebSocketDisconnect
 from sonix.types import ASGIApp, Message, Receive, Scope, Send
 
 ExceptionHandler = Callable[[Request, Exception], Awaitable[Response]]
@@ -115,6 +116,9 @@ class ExceptionMiddleware:
         return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            await self._call_websocket(scope, receive, send)
+            return
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -152,6 +156,48 @@ class ExceptionMiddleware:
 
             response = await handler(Request(scope, receive), exc)
             await response(scope, receive, send)
+
+    async def _call_websocket(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Turn an exception into a close.
+
+        Deliberately not routed through the user handler registry: an
+        ExceptionHandler returns a Response, which a websocket has nowhere to
+        put. Making it extensible would mean a second handler protocol and a
+        second registry for something nothing yet needs; adding one later is
+        purely additive. So this branch converts, and does not dispatch.
+        """
+        closed = False
+
+        async def wrapped_send(message: Message) -> None:
+            nonlocal closed
+            if message["type"] == "websocket.close":
+                closed = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, wrapped_send)
+        except WebSocketDisconnect:
+            # The peer is gone. Not an error, and there is nobody to close.
+            return
+        except Exception as exc:
+            code, reason = _close_for(exc)
+            if not isinstance(exc, WebSocketException | HTTPException):
+                traceback.print_exc()
+            if not closed:
+                await send({"type": "websocket.close", "code": code, "reason": reason})
+            if self.debug and not isinstance(exc, WebSocketException | HTTPException):
+                raise
+
+
+def _close_for(exc: Exception) -> tuple[int, str]:
+    if isinstance(exc, WebSocketException):
+        return exc.code, exc.reason
+    if isinstance(exc, HTTPException):
+        # A 422 from dependency injection on ws://host/path?limit=abc is the
+        # motivating case: without this the handler dies and the client waits
+        # forever instead of being told it sent something unusable.
+        return 1008, exc.detail
+    return 1011, "internal error"
 
 
 def build_stack(

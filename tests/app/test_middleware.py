@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import pytest
-from helpers import fake_receive, make_scope, make_send
+from helpers import fake_receive, make_scope, make_send, make_ws_scope
 
 from sonix.app.applications import Sonix
-from sonix.app.exceptions import HTTPException
+from sonix.app.exceptions import HTTPException, WebSocketException
 from sonix.app.middleware import ExceptionMiddleware, Middleware, build_stack
 from sonix.app.requests import ClientDisconnect, Request
 from sonix.app.responses import PlainTextResponse
+from sonix.app.websockets import WebSocketDisconnect
 from sonix.types import Message, Receive, Scope, Send
 
 
@@ -443,3 +444,98 @@ class TestStreamingInterception:
             "http.response.body",
             "http.response.body",
         ]
+
+
+class TestWebSocketExceptions:
+    """A raising websocket handler must close the socket, not vanish."""
+
+    @staticmethod
+    def _run(app):
+        send, sent = make_send()
+        stack = ExceptionMiddleware(app)
+        return stack, send, sent
+
+    async def test_websocket_exception_closes_with_its_code(self):
+        async def app(scope, receive, send):
+            raise WebSocketException(4001, "nope")
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent == [{"type": "websocket.close", "code": 4001, "reason": "nope"}]
+
+    async def test_http_exception_becomes_a_1008(self):
+        # The motivating case is a dependency-injection 422 on a websocket
+        # query string: without this the handler dies and the client waits.
+        async def app(scope, receive, send):
+            raise HTTPException(422, "bad query")
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent == [
+            {"type": "websocket.close", "code": 1008, "reason": "bad query"}
+        ]
+
+    async def test_unexpected_exception_becomes_a_1011(self, capsys):
+        async def app(scope, receive, send):
+            raise RuntimeError("boom")
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent[0]["code"] == 1011
+        assert "boom" in capsys.readouterr().err
+
+    async def test_disconnect_is_not_an_error(self):
+        async def app(scope, receive, send):
+            raise WebSocketDisconnect(1006)
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent == []
+
+    async def test_no_second_close_after_the_app_already_closed(self):
+        async def app(scope, receive, send):
+            await send({"type": "websocket.close", "code": 1000, "reason": ""})
+            raise RuntimeError("after close")
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert [m["code"] for m in sent] == [1000]
+
+    async def test_clean_handler_is_untouched(self):
+        async def app(scope, receive, send):
+            await send({"type": "websocket.accept", "subprotocol": None})
+
+        stack, send, sent = self._run(app)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent == [{"type": "websocket.accept", "subprotocol": None}]
+
+    async def test_debug_reraises_after_closing(self):
+        async def app(scope, receive, send):
+            raise RuntimeError("boom")
+
+        send, sent = make_send()
+        stack = ExceptionMiddleware(app, debug=True)
+        with pytest.raises(RuntimeError, match="boom"):
+            await stack(make_ws_scope(), fake_receive, send)
+        # Closed first: debug is for the developer, but the client still
+        # deserves an answer.
+        assert sent[0]["code"] == 1011
+
+    async def test_debug_does_not_reraise_a_websocket_exception(self):
+        async def app(scope, receive, send):
+            raise WebSocketException(1008, "policy")
+
+        send, sent = make_send()
+        stack = ExceptionMiddleware(app, debug=True)
+        await stack(make_ws_scope(), fake_receive, send)
+        assert sent[0]["code"] == 1008
+
+    async def test_lifespan_scopes_still_pass_straight_through(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(scope["type"])
+
+        stack, send, _ = self._run(app)
+        await stack({"type": "lifespan"}, fake_receive, send)
+        assert seen == ["lifespan"]
