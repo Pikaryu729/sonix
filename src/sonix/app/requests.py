@@ -172,6 +172,15 @@ class Request:
         # than a plain __getitem__ lookup.
         return self._scope.get("path_params", {})
 
+    @property
+    def state(self) -> dict[str, Any]:
+        # A shallow copy of whatever the lifespan yielded, put here by the
+        # server. Per-request, so a handler may stash values on it without
+        # leaking them into the next request; the objects the lifespan opened
+        # stay shared. Empty when running without a lifespan, so reading it is
+        # always safe.
+        return self._scope.get("state", {})
+
     @cached_property
     def headers(self) -> Headers:
         return Headers(self._scope["headers"])

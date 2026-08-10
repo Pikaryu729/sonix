@@ -107,7 +107,11 @@ class Route:
     converters: dict[str, Converter]
     methods: tuple[str, ...]
     handler: ASGIApp
-    di_plan: Any | None = None
+    # No di_plan field. docs/architecture.md originally put the DI plan here,
+    # but by the time a Route exists the handler has already been wrapped into
+    # an ASGIApp that closes over its own plan -- which is where the signature
+    # was known in the first place. A field routing never reads is worse than
+    # no field.
 
 
 class Router:
@@ -136,7 +140,7 @@ class Router:
         route_methods = tuple(
             m.upper() for m in (methods if methods is not None else ["GET"])
         )
-        self._routes.append(Route(pattern, converters, route_methods, handler, None))
+        self._routes.append(Route(pattern, converters, route_methods, handler))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope["path"]

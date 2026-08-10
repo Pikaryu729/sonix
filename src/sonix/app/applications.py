@@ -15,10 +15,12 @@ middleware is registered.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import Callable
 from typing import Any
 
+from sonix.app.di import build_plan, resolve
 from sonix.app.lifespan import (
     LifespanFactory,
     LifespanHandler,
@@ -32,12 +34,14 @@ from sonix.app.middleware import (
 )
 from sonix.app.requests import Request
 from sonix.app.responses import JSONResponse, PlainTextResponse, Response
-from sonix.app.routing import Router
+from sonix.app.routing import Router, compile_path
 from sonix.types import ASGIApp, Receive, Scope, Send
 
-# Any is broad enough to cover a sync return value or an Awaitable one --
-# a separate Awaitable[Any] arm would be redundant.
-Handler = Callable[[Request], Any]
+# Callable[..., Any] rather than Callable[[Request], Any]: since DI landed a
+# handler declares whatever parameters it needs, and the plan decides how to
+# fill them. Any on the return covers a sync value or an awaitable one -- a
+# separate Awaitable[Any] arm would be redundant.
+Handler = Callable[..., Any]
 
 
 def _is_coroutine_callable(handler: Handler) -> bool:
@@ -67,17 +71,43 @@ def _coerce_response(result: Any) -> Response:
     return JSONResponse(result)
 
 
-def _endpoint(handler: Handler) -> ASGIApp:
+def _endpoint(handler: Handler, path: str) -> ASGIApp:
     is_coroutine = _is_coroutine_callable(handler)
+    # Inspected exactly once, here, at decoration time. compile_path is called
+    # a second time (Router.add_route does it too) purely to learn which names
+    # the template binds; that is registration-time work, not per-request.
+    _pattern, path_converters = compile_path(path)
+    plan = build_plan(handler, path_converters=path_converters)
+
+    async def run(
+        request: Request,
+        stack: contextlib.AsyncExitStack | None,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        kwargs = await resolve(plan, request, stack)
+        if is_coroutine:
+            result = await handler(**kwargs)
+        else:
+            result = await asyncio.to_thread(handler, **kwargs)
+        response = _coerce_response(result)
+        await response(scope, receive, send)
 
     async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
-        if is_coroutine:
-            result = await handler(request)
-        else:
-            result = await asyncio.to_thread(handler, request)
-        response = _coerce_response(result)
-        await response(scope, receive, send)
+        if not plan.needs_teardown:
+            # No `yield` dependency in the graph, so an AsyncExitStack would
+            # have nothing to close. Constructing one per request is not free,
+            # and every handler written before DI existed takes this path.
+            await run(request, None, scope, receive, send)
+            return
+        # The stack wraps sending the response too, so a `yield` dependency's
+        # teardown runs *after* the body is on the wire -- closing a database
+        # connection before the rows it produced have been serialized would be
+        # a subtle and infuriating bug.
+        async with contextlib.AsyncExitStack() as stack:
+            await run(request, stack, scope, receive, send)
 
     return endpoint
 
@@ -179,7 +209,7 @@ class Sonix:
     def add_route(
         self, path: str, handler: Handler, methods: list[str] | None = None
     ) -> None:
-        self.router.add_route(path, _endpoint(handler), methods=methods)
+        self.router.add_route(path, _endpoint(handler, path), methods=methods)
 
     def get(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, methods=["GET"])
