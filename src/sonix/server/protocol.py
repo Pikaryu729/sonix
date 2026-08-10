@@ -55,6 +55,12 @@ DEFAULT_HEAD_TIMEOUT = 10.0
 # purpose: a connection that has already been used has proved nothing about
 # whether the client intends to use it again.
 DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
+# asyncio's own transport defaults, restated rather than inherited: the point
+# of the knob is that the policy is Sonix's to state. Note the unit differs
+# from the watermarks below -- these count *bytes buffered in the transport*,
+# those count *messages queued for the application*.
+DEFAULT_WRITE_PAUSE_WATERMARK = 64 * 1024
+DEFAULT_WRITE_RESUME_WATERMARK = 16 * 1024
 DEFAULT_BODY_PAUSE_WATERMARK = 32
 DEFAULT_BODY_RESUME_WATERMARK = 8
 DEFAULT_WS_PAUSE_WATERMARK = 32
@@ -283,6 +289,8 @@ class HTTPProtocol(asyncio.Protocol):
         # is a resource-policy knob a deployment behind a connection-pooling
         # proxy may legitimately turn off.
         keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT,
+        write_pause_watermark: int = DEFAULT_WRITE_PAUSE_WATERMARK,
+        write_resume_watermark: int = DEFAULT_WRITE_RESUME_WATERMARK,
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
         websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
@@ -300,6 +308,8 @@ class HTTPProtocol(asyncio.Protocol):
         self._max_body_size = max_body_size
         self._head_timeout = head_timeout
         self._keep_alive_timeout = keep_alive_timeout
+        self._write_pause_watermark = write_pause_watermark
+        self._write_resume_watermark = write_resume_watermark
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
         self._websocket_max_message_size = websocket_max_message_size
@@ -339,6 +349,22 @@ class HTTPProtocol(asyncio.Protocol):
             max_body_size=self._max_body_size,
             upgrade_protocols=self._upgrade_protocols,
         )
+        # set_write_buffer_limits had never been called: pause_writing,
+        # resume_writing and _drain were running on asyncio's defaults, which
+        # is the difference between "we chose this" and "we inherited it". An
+        # unbounded-in-practice write buffer is how one slow reader turns a
+        # streaming response into server-side memory growth.
+        try:
+            self.transport.set_write_buffer_limits(
+                high=self._write_pause_watermark,
+                low=self._write_resume_watermark,
+            )
+        except NotImplementedError:
+            # asyncio.Transport's base implementation raises, so a transport
+            # with no write buffer at all -- a test double, or a foreign
+            # transport -- lands here. A hardening knob must not be able to
+            # break a connection that would otherwise work.
+            pass
         self._loop = asyncio.get_running_loop()
         self._client = self.transport.get_extra_info("peername")
         self._server = self.transport.get_extra_info("sockname")
@@ -351,7 +377,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._closed = False
         self._reading_paused = False
         self._paused_writing = False
-        self._drain_waiter: asyncio.Future[None] | None = None
+        self._drain_waiters: list[asyncio.Future[None]] = []
 
         # None means "ordinary HTTP connection". Everything else here stays
         # unset until an upgrade head arrives.
@@ -468,6 +494,12 @@ class HTTPProtocol(asyncio.Protocol):
         self._disarm_timeout()
         self._disarm_ws_ping()
         self._disconnected = True
+        # Anyone blocked in _drain() is waiting on a resume_writing() that is
+        # never coming. Resolve rather than cancel: the caller returns into
+        # send(), whose is_closing() guards drop the write, and unwinds its own
+        # way -- instead of waiting a full loop iteration for the deferred
+        # task.cancel() below.
+        self._wake_drain_waiters()
         if self._server_state is not None:
             self._server_state.connections.discard(self)
         for queue in self._receive_queues:
@@ -499,19 +531,36 @@ class HTTPProtocol(asyncio.Protocol):
 
     def resume_writing(self) -> None:
         self._paused_writing = False
-        waiter = self._drain_waiter
-        if waiter is not None and not waiter.done():
-            waiter.set_result(None)
+        self._wake_drain_waiters()
+
+    def _wake_drain_waiters(self) -> None:
+        waiters, self._drain_waiters = self._drain_waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
 
     async def _drain(self) -> None:
-        if not self._paused_writing:
+        """Block while the transport's write buffer is over its high mark.
+
+        A list rather than the single slot this used to be. One slot is only
+        correct while exactly one coroutine can be writing, and a websocket
+        application with a reader task and a writer task breaks that: the
+        second caller's future replaced the first's, and the first was then
+        never resolved. Its only cure was the connection dying -- a permanent
+        hang, not backpressure.
+        """
+        if not self._paused_writing or self._closed:
             return
         waiter = self._loop.create_future()
-        self._drain_waiter = waiter
+        self._drain_waiters.append(waiter)
         try:
             await waiter
         finally:
-            self._drain_waiter = None
+            # Cancellation is the other way out of here. Drop the future so a
+            # cancelled task does not leave one retained for the life of a
+            # long keep-alive connection.
+            if waiter in self._drain_waiters:
+                self._drain_waiters.remove(waiter)
 
     # -- incoming bytes ---------------------------------------------------------
 

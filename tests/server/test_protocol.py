@@ -23,6 +23,7 @@ class FakeTransport(asyncio.Transport):
         self.written = bytearray()
         self.closed = False
         self.paused = False
+        self.write_buffer_limits = None
         self._peername = peername
         self._sockname = sockname
 
@@ -45,6 +46,14 @@ class FakeTransport(asyncio.Transport):
 
     def resume_reading(self) -> None:
         self.paused = False
+
+    def set_write_buffer_limits(self, high=None, low=None) -> None:
+        # asyncio.Transport's base implementation raises NotImplementedError,
+        # so without this every protocol test breaks the moment
+        # connection_made starts calling it. Recorded rather than ignored so a
+        # test can assert the limits are actually applied -- a bare guard in
+        # the protocol would silently permit deleting the call.
+        self.write_buffer_limits = (high, low)
 
 
 def make_gated_app(release: asyncio.Event):
@@ -1090,3 +1099,133 @@ class TestWebSocketKeepalive:
         protocol.data_received(HANDSHAKE)
         await asyncio.sleep(0.1)
         assert b"101 Switching Protocols" not in bytes(transport.written)
+
+
+class TestWriteBackpressure:
+    """The write half of backpressure, which had no coverage at all.
+
+    TestBackpressure above covers the read half (pause_reading when the app
+    falls behind). This is the other direction: the app producing faster than
+    the socket drains.
+    """
+
+    @staticmethod
+    def streaming_app(progress: list[str]):
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-length", b"6")],
+                }
+            )
+            await send(
+                {"type": "http.response.body", "body": b"one", "more_body": True}
+            )
+            progress.append("one")
+            await send({"type": "http.response.body", "body": b"two"})
+            progress.append("two")
+
+        return app
+
+    async def test_a_paused_transport_blocks_the_next_body_chunk(self):
+        # The headline: _drain must actually block. Note where it blocks --
+        # send() writes the chunk and *then* drains, so the first chunk's
+        # bytes are on the transport while the app is still suspended inside
+        # that same send() call and has not reached its own next statement.
+        # That is exactly the signature of backpressure working: bytes out,
+        # producer stopped.
+        progress: list[str] = []
+        protocol, transport = make_protocol(self.streaming_app(progress))
+        protocol.pause_writing()
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        assert b"one" in transport.written
+        assert b"two" not in transport.written
+        assert progress == []
+
+        protocol.resume_writing()
+        await asyncio.sleep(0.05)
+        assert progress == ["one", "two"]
+        assert b"two" in transport.written
+
+    async def test_two_concurrent_senders_both_resume(self):
+        # The single-slot regression. With one _drain_waiter slot the second
+        # caller's future replaced the first's and the first was never
+        # resolved -- a permanent hang, reachable by any websocket app with a
+        # reader task and a writer task.
+        done = asyncio.Event()
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await asyncio.gather(
+                send({"type": "websocket.send", "text": "a"}),
+                send({"type": "websocket.send", "text": "b"}),
+            )
+            done.set()
+
+        protocol, _transport = make_protocol(app)
+        # Paused before the handshake, so both sends land on a transport that
+        # is already over its high-water mark and both must wait.
+        protocol.pause_writing()
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert not done.is_set()
+
+        protocol.resume_writing()
+        await asyncio.wait_for(done.wait(), timeout=1)
+
+    async def test_connection_lost_releases_a_blocked_send(self):
+        # A drain waiter is waiting on a resume_writing() that will never come.
+        # Resolving them on connection_lost is what stops the task hanging
+        # until it is cancelled a loop iteration later.
+        released = asyncio.Event()
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-length", b"6")],
+                }
+            )
+            await send(
+                {"type": "http.response.body", "body": b"one", "more_body": True}
+            )
+            released.set()
+
+        protocol, _transport = make_protocol(app)
+        protocol.pause_writing()
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        assert not released.is_set()
+
+        protocol.connection_lost(None)
+        await asyncio.wait_for(released.wait(), timeout=1)
+
+    async def test_write_buffer_limits_are_applied(self):
+        _protocol, transport = make_protocol(fixed_response_app)
+        assert transport.write_buffer_limits == (64 * 1024, 16 * 1024)
+
+        _protocol, transport = make_protocol(
+            fixed_response_app,
+            write_pause_watermark=4096,
+            write_resume_watermark=1024,
+        )
+        assert transport.write_buffer_limits == (4096, 1024)
+
+    async def test_a_transport_without_write_buffer_limits_still_works(self):
+        # The guard on the guard: asyncio.Transport's base implementation
+        # raises, and a hardening knob must not break a connection that would
+        # otherwise work.
+        class NoLimitsTransport(FakeTransport):
+            def set_write_buffer_limits(self, high=None, low=None) -> None:
+                raise NotImplementedError
+
+        protocol = HTTPProtocol(fixed_response_app)
+        transport = NoLimitsTransport()
+        protocol.connection_made(transport)
+        protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 200 OK\r\n")

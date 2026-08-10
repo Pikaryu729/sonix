@@ -27,6 +27,8 @@ from sonix.server.protocol import (
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
     DEFAULT_KEEP_ALIVE_TIMEOUT,
+    DEFAULT_WRITE_PAUSE_WATERMARK,
+    DEFAULT_WRITE_RESUME_WATERMARK,
     DEFAULT_WS_PAUSE_WATERMARK,
     DEFAULT_WS_PING_INTERVAL,
     DEFAULT_WS_PING_TIMEOUT,
@@ -181,6 +183,10 @@ class Config:
     # answer different questions: how long may a client take to send a request
     # head, versus how long may it hold an unused connection open.
     keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT
+    # Bytes buffered in the transport before asyncio calls pause_writing --
+    # the write half of backpressure, where the two below are the read half.
+    write_pause_watermark: int = DEFAULT_WRITE_PAUSE_WATERMARK
+    write_resume_watermark: int = DEFAULT_WRITE_RESUME_WATERMARK
     body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK
     body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK
 
@@ -224,6 +230,8 @@ class Config:
             max_body_size=self.max_body_size,
             head_timeout=self.head_timeout,
             keep_alive_timeout=self.keep_alive_timeout,
+            write_pause_watermark=self.write_pause_watermark,
+            write_resume_watermark=self.write_resume_watermark,
             body_pause_watermark=self.body_pause_watermark,
             body_resume_watermark=self.body_resume_watermark,
             websocket_max_message_size=self.websocket_max_message_size,
