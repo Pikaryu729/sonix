@@ -13,6 +13,9 @@ import importlib
 import sys
 
 from sonix.app.applications import Sonix
+from sonix.app.di import Depends
+from sonix.app.exceptions import HTTPException, ValidationError
+from sonix.app.middleware import Middleware
 from sonix.app.requests import Request
 from sonix.app.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from sonix.server.protocol import HTTPProtocol
@@ -22,14 +25,18 @@ from sonix.types import ASGIApp
 __all__ = [
     "ASGIApp",
     "Config",
+    "Depends",
     "HTMLResponse",
+    "HTTPException",
     "HTTPProtocol",
     "JSONResponse",
+    "Middleware",
     "PlainTextResponse",
     "Request",
     "Response",
     "Server",
     "Sonix",
+    "ValidationError",
     "main",
     "run",
 ]
