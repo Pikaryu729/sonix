@@ -410,3 +410,40 @@ class TestRealSocketRoundTrip:
         finally:
             writer.close()
             await writer.wait_closed()
+
+
+class TestUpgradeNotYetImplemented:
+    """Until the websocket bridge lands, an upgrade head must be refused.
+
+    The parser stops framing HTTP the moment it sees one, so no body events
+    will ever follow. Dispatching it as an ordinary request would leave the
+    application blocked in receive() for the life of the connection.
+    """
+
+    HANDSHAKE = (
+        b"GET /ws HTTP/1.1\r\n"
+        b"Host: e.com\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n"
+        b"\r\n"
+    )
+
+    async def test_upgrade_request_gets_501_and_closes(self):
+        protocol, transport = make_protocol(fixed_response_app)
+        protocol.data_received(self.HANDSHAKE)
+        await asyncio.sleep(0.05)
+        assert bytes(transport.written).startswith(b"HTTP/1.1 501 Not Implemented\r\n")
+        assert transport.closed is True
+
+    async def test_pipelined_request_ahead_of_an_upgrade_is_still_answered(self):
+        protocol, transport = make_protocol(fixed_response_app)
+        protocol.data_received(
+            b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\n" + self.HANDSHAKE
+        )
+        await asyncio.sleep(0.05)
+        written = bytes(transport.written)
+        assert written.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert b"501 Not Implemented" in written
+        assert written.index(b"200 OK") < written.index(b"501 Not Implemented")

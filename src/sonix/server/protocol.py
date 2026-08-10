@@ -347,6 +347,13 @@ class HTTPProtocol(asyncio.Protocol):
             if not self._got_first_head:
                 self._got_first_head = True
                 self._disarm_head_timeout()
+            if event.head.upgrade is not None:
+                # The parser has stopped framing HTTP for this connection, so
+                # no body events will ever follow this head. Dispatching it as
+                # an ordinary request would leave an app blocked in receive()
+                # forever. Refuse until the websocket bridge lands.
+                self._reject_upgrade()
+                return
             self._begin_request(event.head)
         elif isinstance(event, BodyChunk):
             self._push_body_chunk(
@@ -360,6 +367,14 @@ class HTTPProtocol(asyncio.Protocol):
             pass
         else:  # pragma: no cover - exhaustive over Event
             raise AssertionError(f"unhandled parser event: {event!r}")  # noqa: TRY004
+
+    def _reject_upgrade(self) -> None:
+        self._closed = True
+        self._disarm_head_timeout()
+        my_turn = self._write_turnstile
+        task = self._loop.create_task(self._write_failure_response(501, my_turn))
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
 
     def _fail(self, exc: HTTPParserError) -> None:
         self._closed = True
