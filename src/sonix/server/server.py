@@ -26,6 +26,7 @@ from sonix.server.protocol import (
     DEFAULT_BODY_PAUSE_WATERMARK,
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
+    DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_WS_PAUSE_WATERMARK,
     DEFAULT_WS_PING_INTERVAL,
     DEFAULT_WS_PING_TIMEOUT,
@@ -176,6 +177,10 @@ class Config:
     max_headers: int = 100
     max_body_size: int = 16 * 1024 * 1024
     head_timeout: float = DEFAULT_HEAD_TIMEOUT
+    # None disables idle reaping. Separate from head_timeout because the two
+    # answer different questions: how long may a client take to send a request
+    # head, versus how long may it hold an unused connection open.
+    keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT
     body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK
     body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK
 
@@ -218,6 +223,7 @@ class Config:
             max_headers=self.max_headers,
             max_body_size=self.max_body_size,
             head_timeout=self.head_timeout,
+            keep_alive_timeout=self.keep_alive_timeout,
             body_pause_watermark=self.body_pause_watermark,
             body_resume_watermark=self.body_resume_watermark,
             websocket_max_message_size=self.websocket_max_message_size,

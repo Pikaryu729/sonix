@@ -47,6 +47,16 @@ class FakeTransport(asyncio.Transport):
         self.paused = False
 
 
+def make_gated_app(release: asyncio.Event):
+    """An app that holds its response open until `release` is set."""
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await release.wait()
+        await fixed_response_app(scope, receive, send)
+
+    return app
+
+
 def make_protocol(app, **kwargs) -> tuple[HTTPProtocol, FakeTransport]:
     protocol = HTTPProtocol(app, **kwargs)
     transport = FakeTransport()
@@ -259,6 +269,113 @@ class TestSlowLoris:
         protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
         await asyncio.sleep(0.15)
         assert b"HTTP/1.1 408" not in transport.written
+
+
+class TestIdleTimeout:
+    """Reaping connections that finished a request and then went quiet.
+
+    Before the timer was re-armable it was disarmed by a one-shot latch on the
+    first head, so a client could complete one request and then hold the
+    socket open forever -- a resource-exhaustion hole in a server that makes a
+    point of resource-exhaustion defense.
+    """
+
+    REQUEST = b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n"
+
+    async def test_an_idle_keep_alive_connection_is_reaped(self):
+        protocol, transport = make_protocol(
+            fixed_response_app, head_timeout=10.0, keep_alive_timeout=0.05
+        )
+        protocol.data_received(self.REQUEST)
+        await asyncio.sleep(0.15)
+        assert transport.closed
+
+    async def test_the_idle_reap_is_silent_rather_than_a_408(self):
+        # A 408 would reach a client with nothing outstanding, which will pair
+        # it with whatever request it writes next.
+        protocol, transport = make_protocol(
+            fixed_response_app, head_timeout=10.0, keep_alive_timeout=0.05
+        )
+        protocol.data_received(self.REQUEST)
+        await asyncio.sleep(0.15)
+        assert b"408" not in transport.written
+        assert transport.written.count(b"HTTP/1.1") == 1
+
+    async def test_a_partial_next_head_gets_the_head_timeout_and_a_408(self):
+        # THE trap. Bytes in the parser buffer after a response mean the next
+        # head is already partly here -- slow loris, not idleness. With the
+        # modes inverted the first assertion fails, because the generous
+        # keep-alive deadline would have been applied to an attack.
+        protocol, transport = make_protocol(
+            fixed_response_app, head_timeout=0.3, keep_alive_timeout=0.05
+        )
+        protocol.data_received(self.REQUEST)
+        await asyncio.sleep(0.01)
+        protocol.data_received(b"GET /slow HTT")
+        await asyncio.sleep(0.15)
+        assert not transport.closed
+        await asyncio.sleep(0.3)
+        assert bytes(transport.written).endswith(b"Request Timeout")
+
+    async def test_a_dripping_head_cannot_extend_its_own_deadline(self):
+        # The promotion to head mode fires only on the idle -> mid-request
+        # transition, so a drip-feeder cannot keep re-arming its own timer.
+        protocol, transport = make_protocol(
+            fixed_response_app, head_timeout=0.15, keep_alive_timeout=5.0
+        )
+        protocol.data_received(self.REQUEST)
+        for _ in range(10):
+            await asyncio.sleep(0.03)
+            if transport.closed:
+                break
+            protocol.data_received(b"x")
+        assert b"HTTP/1.1 408" in transport.written
+
+    async def test_no_timer_while_a_request_is_in_flight(self):
+        release = asyncio.Event()
+        protocol, transport = make_protocol(
+            make_gated_app(release), head_timeout=0.05, keep_alive_timeout=0.05
+        )
+        protocol.data_received(self.REQUEST)
+        await asyncio.sleep(0.2)
+        assert not transport.closed
+        release.set()
+        await asyncio.sleep(0.05)
+        assert b"HTTP/1.1 200 OK" in transport.written
+
+    async def test_pipelining_arms_only_after_the_last_response(self):
+        release = asyncio.Event()
+        protocol, transport = make_protocol(
+            make_gated_app(release), head_timeout=5.0, keep_alive_timeout=0.05
+        )
+        protocol.data_received(self.REQUEST + self.REQUEST)
+        await asyncio.sleep(0.15)
+        assert not transport.closed
+        release.set()
+        await asyncio.sleep(0.05)
+        assert transport.written.count(b"HTTP/1.1 200 OK") == 2
+
+    async def test_keep_alive_timeout_none_disables_the_reap(self):
+        protocol, transport = make_protocol(
+            fixed_response_app, head_timeout=10.0, keep_alive_timeout=None
+        )
+        protocol.data_received(self.REQUEST)
+        await asyncio.sleep(0.15)
+        assert not transport.closed
+
+    async def test_a_websocket_is_never_reaped_by_the_http_timer(self):
+        # Once upgraded, liveness is the ping timer's job and hours of silence
+        # are healthy. Both HTTP deadlines are set absurdly short here.
+        protocol, transport = make_protocol(
+            make_ws_app(),
+            head_timeout=0.05,
+            keep_alive_timeout=0.05,
+            ws_ping_interval=None,
+        )
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.2)
+        assert not transport.closed
+        assert b"408" not in transport.written
 
 
 class TestDisconnect:

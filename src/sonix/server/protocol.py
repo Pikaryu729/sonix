@@ -51,6 +51,10 @@ from sonix.server.websockets import (
 from sonix.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_HEAD_TIMEOUT = 10.0
+# Matches uvicorn's --timeout-keep-alive. Shorter than head_timeout on
+# purpose: a connection that has already been used has proved nothing about
+# whether the client intends to use it again.
+DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
 DEFAULT_BODY_PAUSE_WATERMARK = 32
 DEFAULT_BODY_RESUME_WATERMARK = 8
 DEFAULT_WS_PAUSE_WATERMARK = 32
@@ -65,6 +69,19 @@ _PARSER_ERROR_STATUS: dict[type[HTTPParserError], int] = {
     MalformedRequest: 400,
     RequestTooLarge: 413,
 }
+
+
+class _TimerMode(enum.Enum):
+    """Why the connection timer is currently armed.
+
+    HEAD covers both "no bytes yet" and "a head is arriving one byte at a
+    time" -- the same condition from the server's point of view, and the same
+    answer. KEEP_ALIVE covers a connection sitting at a request boundary with
+    an empty buffer.
+    """
+
+    HEAD = enum.auto()
+    KEEP_ALIVE = enum.auto()
 
 
 class _WSState(enum.Enum):
@@ -261,6 +278,11 @@ class HTTPProtocol(asyncio.Protocol):
         max_headers: int = 100,
         max_body_size: int = 16 * 1024 * 1024,
         head_timeout: float = DEFAULT_HEAD_TIMEOUT,
+        # float rather than float | None, unlike keep_alive_timeout below:
+        # this is the slow-loris defense and is never optional. Idle reaping
+        # is a resource-policy knob a deployment behind a connection-pooling
+        # proxy may legitimately turn off.
+        keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT,
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
         websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
@@ -277,6 +299,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._max_headers = max_headers
         self._max_body_size = max_body_size
         self._head_timeout = head_timeout
+        self._keep_alive_timeout = keep_alive_timeout
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
         self._websocket_max_message_size = websocket_max_message_size
@@ -326,7 +349,6 @@ class HTTPProtocol(asyncio.Protocol):
         self._write_turnstile: asyncio.Event = _set_event()
         self._disconnected = False
         self._closed = False
-        self._got_first_head = False
         self._reading_paused = False
         self._paused_writing = False
         self._drain_waiter: asyncio.Future[None] | None = None
@@ -346,26 +368,81 @@ class HTTPProtocol(asyncio.Protocol):
         # flag means an unsolicited pong cannot clear a real deadline.
         self._ws_pending_ping: bytes | None = None
 
-        self._head_timeout_handle: asyncio.TimerHandle | None = self._loop.call_later(
-            self._head_timeout, self._on_head_timeout
-        )
+        self._timeout_handle: asyncio.TimerHandle | None = None
+        self._timeout_mode: _TimerMode | None = None
+        self._arm_timeout(_TimerMode.HEAD)
 
         if self._server_state is not None:
             self._server_state.connections.add(self)
 
-    def _disarm_head_timeout(self) -> None:
-        if self._head_timeout_handle is not None:
-            self._head_timeout_handle.cancel()
-            self._head_timeout_handle = None
+    # -- the connection timer ---------------------------------------------------
 
-    def _on_head_timeout(self) -> None:
+    def _arm_timeout(self, mode: _TimerMode) -> None:
+        """(Re)arm the single connection timer in one of its two modes.
+
+        One timer rather than two: at most one of "waiting for a head" and
+        "idle between requests" is ever true, and two handles would mean two
+        cancel sites to keep in step.
+        """
+        self._disarm_timeout()
+        # Never on a websocket. Once _ws_state is set this has stopped being
+        # an HTTP connection: its liveness is the ping timer's job, and hours
+        # of silence are healthy rather than suspicious.
+        if self._closed or self._ws_state is not None:
+            return
+        if self.transport is None or self.transport.is_closing():
+            return
+        delay = (
+            self._head_timeout if mode is _TimerMode.HEAD else self._keep_alive_timeout
+        )
+        if delay is None:
+            return
+        self._timeout_mode = mode
+        self._timeout_handle = self._loop.call_later(delay, self._on_timeout)
+
+    def _disarm_timeout(self) -> None:
+        if self._timeout_handle is not None:
+            self._timeout_handle.cancel()
+        self._timeout_handle = None
+        self._timeout_mode = None
+
+    def _arm_idle_timeout(self) -> None:
+        """Arm the between-requests timer, picking the mode from the parser.
+
+        The trap in this whole mechanism. A non-empty parser buffer after a
+        response means the *next* request head is already partly here -- that
+        is slow loris, not idleness, and it gets head_timeout and a 408.
+        Reading it the other way round hands the attacker the more generous
+        deadline, and writes a 408 into a connection whose client is merely
+        thinking -- where that client will pair it with the request it is
+        about to send.
+        """
+        parser = self.parser
+        mid = parser is not None and parser.mid_request
+        self._arm_timeout(_TimerMode.HEAD if mid else _TimerMode.KEEP_ALIVE)
+
+    def _on_timeout(self) -> None:
+        mode, self._timeout_mode = self._timeout_mode, None
+        self._timeout_handle = None
         if (
-            self._got_first_head
-            or self.transport is None
+            self.transport is None
             or self.transport.is_closing()
+            or self._ws_state is not None
+            or not self.is_idle
         ):
             return
         self._closed = True
+        if mode is not _TimerMode.HEAD:
+            # An idle keep-alive connection is closed *silently*. A 408 would
+            # arrive at a client with nothing outstanding, which will pair it
+            # with whatever request it writes next -- possibly one already in
+            # flight. Closing is the only unambiguous signal, and is what
+            # uvicorn and nginx both do here.
+            self.transport.close()
+            return
+        # Nothing has been written on this connection yet, so a 408 is
+        # unambiguous, and RFC 9110 section 15.5.9 is explicit that it is the
+        # right answer to a client that connected and then went quiet.
         body = b"Request Timeout"
         head = _encode_response_head(
             408,
@@ -388,7 +465,7 @@ class HTTPProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._closed = True
-        self._disarm_head_timeout()
+        self._disarm_timeout()
         self._disarm_ws_ping()
         self._disconnected = True
         if self._server_state is not None:
@@ -462,11 +539,28 @@ class HTTPProtocol(asyncio.Protocol):
         for event in events:
             self._handle_event(event)
 
+        # An idle-mode timer whose connection just received the first bytes of
+        # a new request must switch to head mode: what is in the buffer now is
+        # a partial head, and a partial head that never completes is slow
+        # loris. This fires only on the idle -> mid-request transition -- once
+        # the mode is HEAD the condition is False, so a one-byte-per-second
+        # drip cannot keep pushing its own deadline out. If a head completed
+        # in this call, _handle_event already disarmed and the mode is None,
+        # so the check is inert.
+        if (
+            self._timeout_mode is _TimerMode.KEEP_ALIVE
+            and self.parser is not None
+            and self.parser.mid_request
+        ):
+            self._arm_timeout(_TimerMode.HEAD)
+
     def _handle_event(self, event: Event) -> None:
         if isinstance(event, RequestHeadComplete):
-            if not self._got_first_head:
-                self._got_first_head = True
-                self._disarm_head_timeout()
+            # Unconditionally, on every head: a request is now in flight and
+            # neither timeout applies until it finishes. The one-shot
+            # _got_first_head latch this replaces is what left every
+            # keep-alive connection after the first request unreapable.
+            self._disarm_timeout()
             if event.head.upgrade == "websocket":
                 self._begin_websocket(event.head)
                 return
@@ -493,7 +587,7 @@ class HTTPProtocol(asyncio.Protocol):
 
     def _reject_upgrade(self) -> None:
         self._closed = True
-        self._disarm_head_timeout()
+        self._disarm_timeout()
         my_turn = self._write_turnstile
         task = self._loop.create_task(self._write_failure_response(501, my_turn))
         self._inflight_tasks.add(task)
@@ -509,7 +603,7 @@ class HTTPProtocol(asyncio.Protocol):
             self._ws_abort(CloseCode.PROTOCOL_ERROR, "http parsing after upgrade")
             return
         self._closed = True
-        self._disarm_head_timeout()
+        self._disarm_timeout()
         status = _PARSER_ERROR_STATUS.get(type(exc), 400)
         # Any good pipelined requests ahead of this one were just spawned as
         # tasks by _handle_event above but haven't run yet (create_task only
@@ -587,6 +681,7 @@ class HTTPProtocol(asyncio.Protocol):
         if not my_done.is_set():
             my_done.set()
         if task.cancelled():
+            self._arm_idle_if_free()
             return
         exc = task.exception()
         if exc is not None:
@@ -599,6 +694,23 @@ class HTTPProtocol(asyncio.Protocol):
                     "protocol": self,
                 }
             )
+        self._arm_idle_if_free()
+
+    def _arm_idle_if_free(self) -> None:
+        """Start the between-requests timer once nothing is in flight.
+
+        Only when the *last* task finishes: pipelining means several
+        concurrent tasks, and arming while any of them is still running would
+        reap a connection that is busy. A task that raised has already closed
+        the transport, which _arm_timeout's is_closing() guard filters -- so
+        no timer is ever armed on a corpse.
+
+        Note the failure-response tasks spawned by _fail/_reject_upgrade/
+        _fail_handshake do not route through here (they use a bare discard
+        callback) and set _closed anyway, so they cannot re-arm either.
+        """
+        if self.is_idle:
+            self._arm_idle_timeout()
 
     def _make_send(
         self, head: RequestHead, my_turn: asyncio.Event, my_done: asyncio.Event
@@ -756,7 +868,7 @@ class HTTPProtocol(asyncio.Protocol):
 
     def _fail_handshake(self, exc: HandshakeError) -> None:
         self._closed = True
-        self._disarm_head_timeout()
+        self._disarm_timeout()
         my_turn = self._write_turnstile
         task = self._loop.create_task(
             self._write_failure_response(exc.status, my_turn, exc.headers)
