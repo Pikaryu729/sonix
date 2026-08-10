@@ -38,13 +38,34 @@ works on Linux; on Docker Desktop, point the `url` in `fuzzingclient.json` at
 frame with an RSV bit set, so those cases are not a partial implementation to
 be measured -- they are a documented non-goal.
 
-`check_report.py` accepts `NON-STRICT` alongside `OK`. There is one class of
-those and it is deliberate: **UTF-8 is validated on the reassembled message,
-not fail-fast mid-fragment** (cases 6.4.x). The suite considers detecting an
-invalid sequence as early as possible to be strict behaviour; validating per
-fragment instead would reject legitimate traffic where a multi-byte character
-straddles a fragment boundary, so the check happens once the message is
-whole. Fail-fast incremental validation is a hardening item, not a bug.
+`check_report.py` accepts `NON-STRICT` alongside `OK`.
+
+## Current result
+
+**301 cases, 0 failing, 11 non-strict** (run 31429614696). The 11 fall into
+exactly two classes, both understood:
+
+**Fail-fast UTF-8 — cases 6.4.1 through 6.4.4.** UTF-8 is validated on the
+reassembled message, not mid-fragment. The suite considers detecting an
+invalid sequence as early as possible to be strict; validating per fragment
+instead would reject legitimate traffic where a multi-byte character straddles
+a fragment boundary, so the check happens once the message is whole.
+
+**A valid message lost to the close that follows it — cases 3.2, 3.3, 4.1.3,
+4.1.4, 4.2.3, 4.2.4 and 5.15.** Each sends a good message *and then* a
+protocol violation, and expects the echo of the good message before the
+connection fails. Sonix's codec does surface the earlier message
+(`WebSocketProtocolError.partial_events` exists precisely for this), and the
+bridge does queue it for the application — but it then writes the close frame
+and closes the transport in the same event-loop callback, before the
+application task has run. So the echo never reaches the wire.
+
+That is a real, if minor, defect rather than a stylistic difference: a message
+the client legitimately sent is dropped. It is RFC-permitted, which is why the
+suite grades it non-strict rather than failed. Fixing it properly means
+deferring both the close frame and the transport close until the application
+task has drained — a change to the connection teardown path, and therefore a
+hardening-pass item rather than something to bolt on here.
 
 `INFORMATIONAL` is accepted for section 9, where the suite measures
 throughput rather than asserting behaviour.

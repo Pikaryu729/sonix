@@ -71,8 +71,10 @@ Everything below the application code. Specifically:
 - **A WebSocket implementation** (`server/websockets.py`) — the handshake, the
   frame codec, masking, fragmentation reassembly, control-frame handling and
   the close handshake, all written against RFC 6455 and unit-tested purely on
-  bytes. It is checked from the outside by the
-  [Autobahn|Testsuite](tests/autobahn/), which CI runs as a blocking job.
+  bytes. Checked from the outside by the
+  [Autobahn|Testsuite](tests/autobahn/), which CI runs as a blocking job:
+  **301 cases, 0 failing, 11 non-strict** — the non-strict results are two
+  known classes, both written down rather than glossed over.
 - **An upgrade that stops HTTP framing**, which turns out to be a
   request-smuggling defense rather than bookkeeping. A request pipelined
   behind a handshake would otherwise be dispatched as a genuine request on a
@@ -120,7 +122,7 @@ The payoff is checked rather than asserted. CI runs a conformance suite in
 - **A Sonix application served by uvicorn**, launched in a subprocess with an
   import string exactly as a deployment would — HTTP routes and
   `@app.websocket` routes alike.
-- **The Autobahn|Testsuite**, ~500 RFC 6455 cases driven against a Sonix echo
+- **The Autobahn|Testsuite**, 301 RFC 6455 cases driven against a Sonix echo
   server from outside, failing the build on any case that is not OK.
 
 Passing your own unit tests shows the code agrees with itself. Running someone
