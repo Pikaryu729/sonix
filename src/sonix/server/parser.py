@@ -100,6 +100,13 @@ DEFAULT_UPGRADE_PROTOCOLS = frozenset({"websocket"})
 
 _TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HEX_RE = re.compile(rb"^[0-9A-Fa-f]+$")
+# 2**64 is 20 decimal digits, so nothing longer can be a real length. The cap
+# is not cosmetic: CPython refuses str->int conversion past 4300 digits with a
+# plain ValueError, which is not an HTTPParserError and so escaped the whole
+# "reject, never resolve" contract -- the connection died on an unhandled
+# exception instead of getting a clean 4xx. A digit string long enough to
+# trigger that fits easily inside max_header_size.
+_MAX_LENGTH_DIGITS = 20
 _DIGITS_RE = re.compile(rb"^[0-9]+$")
 _VALID_VERSIONS = {b"HTTP/1.0": "1.0", b"HTTP/1.1": "1.1"}
 
@@ -405,6 +412,10 @@ class HTTP11Parser:
             raise MalformedRequest("duplicate Content-Length header")
         if not _DIGITS_RE.fullmatch(value):
             raise MalformedRequest(f"invalid Content-Length value: {value!r}")
+        if len(value) > _MAX_LENGTH_DIGITS:
+            raise RequestTooLarge(
+                f"Content-Length has {len(value)} digits; no real length does"
+            )
         length = int(value)
         if length > self.max_body_size:
             raise RequestTooLarge("Content-Length exceeds max_body_size")
@@ -451,6 +462,13 @@ class HTTP11Parser:
             if line is None:
                 return False
             size_token = line.split(b";", 1)[0].strip()
+            if len(size_token) > _MAX_LENGTH_DIGITS:
+                # Hex conversion is not subject to CPython's decimal-digit
+                # limit, but relying on that implementation detail to stay
+                # safe is fragile, and no real chunk size is this long.
+                raise RequestTooLarge(
+                    f"chunk size has {len(size_token)} digits; no real size does"
+                )
             if not size_token or not _HEX_RE.fullmatch(size_token):
                 raise MalformedRequest(f"invalid chunk size: {line!r}")
             size = int(size_token, 16)
@@ -494,7 +512,15 @@ class HTTP11Parser:
                 events.append(RequestComplete())
                 self._reset_for_next_request()
                 return True
-            return True  # discard trailer header line
+            # Trailers are discarded, but they must still be counted. Each
+            # line is bounded by max_header_size, yet nothing bounded how
+            # *many* could arrive -- and trailers count against neither
+            # max_headers nor max_body_size, so an endless stream of them held
+            # a connection open with no limit reachable at all.
+            self._header_count += 1
+            if self._header_count > self.max_headers:
+                raise RequestTooLarge("too many trailer headers")
+            return True
 
         raise AssertionError(  # pragma: no cover - exhaustive over _ChunkState
             f"unreachable chunk state: {self._chunk_state}"

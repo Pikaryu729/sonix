@@ -90,6 +90,8 @@ class TestConfig:
             max_body_size=4321,
             head_timeout=2.5,
             keep_alive_timeout=0.75,
+            pipeline_pause_watermark=9,
+            pipeline_resume_watermark=4,
             write_pause_watermark=8192,
             write_resume_watermark=2048,
             body_pause_watermark=3,
@@ -111,6 +113,8 @@ class TestConfig:
         assert protocol._max_body_size == 4321
         assert protocol._head_timeout == 2.5
         assert protocol._keep_alive_timeout == 0.75
+        assert protocol._pipeline_pause_watermark == 9
+        assert protocol._pipeline_resume_watermark == 4
         assert protocol._write_pause_watermark == 8192
         assert protocol._write_resume_watermark == 2048
         assert protocol._body_pause_watermark == 3

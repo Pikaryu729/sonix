@@ -360,14 +360,36 @@ class TestIdleTimeout:
         assert b"HTTP/1.1 200 OK" in transport.written
 
     async def test_pipelining_arms_only_after_the_last_response(self):
-        release = asyncio.Event()
+        # The two requests are released *separately*, so there is a real
+        # window in which one task has finished and one has not. Releasing
+        # both at once would close that window inside a single tick.
+        #
+        # Two independent guards keep this correct -- _arm_idle_if_free only
+        # arms when is_idle, and _on_timeout re-checks is_idle before acting
+        # -- so removing either one alone still passes. Removing both fails
+        # here. That is defense in depth rather than a redundant check, and
+        # this test pins the behaviour, not one particular guard.
+        gates = [asyncio.Event(), asyncio.Event()]
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await gates[0 if scope["path"] == "/one" else 1].wait()
+            await fixed_response_app(scope, receive, send)
+
         protocol, transport = make_protocol(
-            make_gated_app(release), head_timeout=5.0, keep_alive_timeout=0.05
+            app, head_timeout=5.0, keep_alive_timeout=0.05
         )
-        protocol.data_received(self.REQUEST + self.REQUEST)
+        protocol.data_received(
+            b"GET /one HTTP/1.1\r\nHost: e.com\r\n\r\n"
+            b"GET /two HTTP/1.1\r\nHost: e.com\r\n\r\n"
+        )
+        gates[0].set()
         await asyncio.sleep(0.15)
+        # One response is done and the other is still running: nothing may
+        # have been reaped, and the keep-alive deadline has long since passed.
         assert not transport.closed
-        release.set()
+        assert transport.written.count(b"HTTP/1.1 200 OK") == 1
+
+        gates[1].set()
         await asyncio.sleep(0.05)
         assert transport.written.count(b"HTTP/1.1 200 OK") == 2
 
@@ -1494,3 +1516,57 @@ class TestWebSocketCloseOrdering:
         protocol.shutdown_websocket()
         assert transport.closed
         assert [f.code for f in server_frames(transport)] == [1002]
+
+
+class TestPipelineDepth:
+    """Bounding how many application tasks one connection can allocate.
+
+    Pipelining lets a client dispatch a task, a queue and a scope per request
+    from a couple of dozen bytes each, and nothing bounded that: the body and
+    websocket watermarks bound one *request's* queue, not how many requests
+    exist. 5000 requests in ~135 KB produced 5000 concurrent tasks with
+    reading never paused.
+    """
+
+    REQUEST = b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n"
+
+    @staticmethod
+    def never_responds():
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await asyncio.Event().wait()
+
+        return app
+
+    async def test_deep_pipelining_pauses_reading(self):
+        protocol, transport = make_protocol(
+            self.never_responds(), pipeline_pause_watermark=8
+        )
+        protocol.data_received(self.REQUEST * 50)
+        await asyncio.sleep(0.05)
+        assert transport.paused is True
+        for task in list(protocol._inflight_tasks):
+            task.cancel()
+
+    async def test_reading_resumes_once_the_backlog_drains(self):
+        release = asyncio.Event()
+        protocol, transport = make_protocol(
+            make_gated_app(release),
+            pipeline_pause_watermark=4,
+            pipeline_resume_watermark=1,
+        )
+        protocol.data_received(self.REQUEST * 10)
+        await asyncio.sleep(0.05)
+        assert transport.paused is True
+
+        release.set()
+        await asyncio.sleep(0.1)
+        assert transport.paused is False
+
+    async def test_a_shallow_pipeline_never_pauses(self):
+        protocol, transport = make_protocol(
+            fixed_response_app, pipeline_pause_watermark=32
+        )
+        protocol.data_received(self.REQUEST * 3)
+        await asyncio.sleep(0.05)
+        assert transport.paused is False
+        assert transport.written.count(b"HTTP/1.1 200 OK") == 3

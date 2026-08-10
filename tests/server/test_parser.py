@@ -781,3 +781,73 @@ class TestMidRequest:
                     p.feed_eof()
             else:
                 p.feed_eof()
+
+
+class TestOversizedNumericFields:
+    """Digit strings long enough to break CPython's int parser.
+
+    Since 3.11, str -> int refuses conversions past 4300 digits with a plain
+    ValueError -- not an HTTPParserError, so it escaped the parser's whole
+    "reject, never resolve" contract and killed the connection on an unhandled
+    exception instead of answering with a 4xx. A digit string that long fits
+    easily inside the default 8 KiB max_header_size.
+    """
+
+    def test_an_absurdly_long_content_length_is_rejected_cleanly(self):
+        p = parser()
+        with pytest.raises(RequestTooLarge, match="digits"):
+            feed(
+                p,
+                b"GET / HTTP/1.1\r\nHost: e.com\r\nContent-Length: "
+                + b"9" * 5000
+                + b"\r\n\r\n",
+            )
+
+    def test_a_content_length_at_the_digit_cap_still_parses(self):
+        # 20 digits covers anything expressible in 64 bits, so the cap cannot
+        # reject a real length -- it only rejects lengths that cannot be real.
+        p = parser(max_body_size=10)
+        with pytest.raises(RequestTooLarge, match="exceeds max_body_size"):
+            feed(
+                p,
+                b"GET / HTTP/1.1\r\nHost: e.com\r\n"
+                b"Content-Length: 99999999999999999999\r\n\r\n",
+            )
+
+    def test_an_absurdly_long_chunk_size_is_rejected_cleanly(self):
+        # Hex conversion is not subject to the decimal-digit limit, but
+        # relying on that implementation detail to stay safe is fragile.
+        p = parser()
+        feed(p, b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n")
+        with pytest.raises(RequestTooLarge, match="digits"):
+            feed(p, b"f" * 5000 + b"\r\n")
+
+
+class TestTrailerLimits:
+    """Chunked trailers count against max_headers.
+
+    Each trailer line was bounded by max_header_size, but nothing bounded how
+    many could arrive -- and trailers count against neither max_body_size nor,
+    previously, max_headers. An endless stream of them held a connection open
+    with no limit reachable at all.
+    """
+
+    PREFIX = (
+        b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"
+    )
+
+    def test_endless_trailers_are_rejected(self):
+        p = parser(max_headers=5)
+        feed(p, self.PREFIX)
+        with pytest.raises(RequestTooLarge, match="trailer"):
+            feed(p, b"".join(b"X-T%d: v\r\n" % i for i in range(500)))
+
+    def test_a_few_trailers_are_still_accepted_and_discarded(self):
+        p = parser(max_headers=100)
+        events = feed(p, self.PREFIX + b"X-Checksum: abc\r\nX-Other: d\r\n\r\n")
+        assert isinstance(events[-1], RequestComplete)
+        # Discarded, not surfaced: the head was emitted before the body began,
+        # so a trailer can never appear among its headers.
+        head = next(e for e in events if isinstance(e, RequestHeadComplete)).head
+        names = [name for name, _ in head.headers]
+        assert b"x-checksum" not in names

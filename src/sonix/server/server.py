@@ -27,6 +27,8 @@ from sonix.server.protocol import (
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
     DEFAULT_KEEP_ALIVE_TIMEOUT,
+    DEFAULT_PIPELINE_PAUSE_WATERMARK,
+    DEFAULT_PIPELINE_RESUME_WATERMARK,
     DEFAULT_SERVER_HEADER,
     DEFAULT_WRITE_PAUSE_WATERMARK,
     DEFAULT_WRITE_RESUME_WATERMARK,
@@ -187,6 +189,11 @@ class Config:
     keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT
     # Bytes buffered in the transport before asyncio calls pause_writing --
     # the write half of backpressure, where the two below are the read half.
+    # Application tasks in flight on one connection before reads stop. This
+    # is what bounds pipelining: a client can otherwise dispatch a task per
+    # request from a couple of dozen bytes each, without limit.
+    pipeline_pause_watermark: int = DEFAULT_PIPELINE_PAUSE_WATERMARK
+    pipeline_resume_watermark: int = DEFAULT_PIPELINE_RESUME_WATERMARK
     write_pause_watermark: int = DEFAULT_WRITE_PAUSE_WATERMARK
     write_resume_watermark: int = DEFAULT_WRITE_RESUME_WATERMARK
     body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK
@@ -207,7 +214,11 @@ class Config:
     ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT
     # How long a close waits for the application task to finish, so a message
     # that arrived in the same batch as the close still gets answered. None
-    # closes immediately.
+    # removes the deadline, which means waiting *indefinitely* -- not closing
+    # immediately. That is the only bound on the deferred-close window, so
+    # disabling it lets a handler that never returns pin the connection open
+    # after a protocol violation, which is the DoS the deadline exists to
+    # prevent.
     ws_close_timeout: float | None = DEFAULT_WS_CLOSE_TIMEOUT
 
     # RFC 9110 section 6.6.1: an origin server with a clock sends Date.
@@ -246,6 +257,8 @@ class Config:
             max_body_size=self.max_body_size,
             head_timeout=self.head_timeout,
             keep_alive_timeout=self.keep_alive_timeout,
+            pipeline_pause_watermark=self.pipeline_pause_watermark,
+            pipeline_resume_watermark=self.pipeline_resume_watermark,
             write_pause_watermark=self.write_pause_watermark,
             write_resume_watermark=self.write_resume_watermark,
             body_pause_watermark=self.body_pause_watermark,

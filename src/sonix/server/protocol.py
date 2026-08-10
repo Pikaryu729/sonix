@@ -63,6 +63,14 @@ DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
 # those count *messages queued for the application*.
 DEFAULT_WRITE_PAUSE_WATERMARK = 64 * 1024
 DEFAULT_WRITE_RESUME_WATERMARK = 16 * 1024
+# How many application tasks one connection may have in flight before the
+# server stops reading from it. Pipelining lets a client dispatch a task per
+# request with tens of bytes each, and nothing else bounds that: the body and
+# websocket watermarks below bound one *request's* queue, not how many
+# requests exist. Without this a single connection can allocate tasks, queues
+# and scopes without limit.
+DEFAULT_PIPELINE_PAUSE_WATERMARK = 32
+DEFAULT_PIPELINE_RESUME_WATERMARK = 8
 DEFAULT_BODY_PAUSE_WATERMARK = 32
 DEFAULT_BODY_RESUME_WATERMARK = 8
 DEFAULT_WS_PAUSE_WATERMARK = 32
@@ -362,6 +370,8 @@ class HTTPProtocol(asyncio.Protocol):
         keep_alive_timeout: float | None = DEFAULT_KEEP_ALIVE_TIMEOUT,
         write_pause_watermark: int = DEFAULT_WRITE_PAUSE_WATERMARK,
         write_resume_watermark: int = DEFAULT_WRITE_RESUME_WATERMARK,
+        pipeline_pause_watermark: int = DEFAULT_PIPELINE_PAUSE_WATERMARK,
+        pipeline_resume_watermark: int = DEFAULT_PIPELINE_RESUME_WATERMARK,
         body_pause_watermark: int = DEFAULT_BODY_PAUSE_WATERMARK,
         body_resume_watermark: int = DEFAULT_BODY_RESUME_WATERMARK,
         websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
@@ -384,6 +394,8 @@ class HTTPProtocol(asyncio.Protocol):
         self._keep_alive_timeout = keep_alive_timeout
         self._write_pause_watermark = write_pause_watermark
         self._write_resume_watermark = write_resume_watermark
+        self._pipeline_pause_watermark = pipeline_pause_watermark
+        self._pipeline_resume_watermark = pipeline_resume_watermark
         self._body_pause_watermark = body_pause_watermark
         self._body_resume_watermark = body_resume_watermark
         self._websocket_max_message_size = websocket_max_message_size
@@ -432,11 +444,15 @@ class HTTPProtocol(asyncio.Protocol):
         # unbounded-in-practice write buffer is how one slow reader turns a
         # streaming response into server-side memory growth.
         try:
+            # ValueError, not just NotImplementedError: asyncio rejects
+            # low > high outright, and a misconfigured pair would otherwise
+            # raise out of connection_made on *every* connection. A tuning
+            # knob must not be able to take the server down.
             self.transport.set_write_buffer_limits(
                 high=self._write_pause_watermark,
                 low=self._write_resume_watermark,
             )
-        except NotImplementedError:
+        except NotImplementedError, ValueError:
             # asyncio.Transport's base implementation raises, so a transport
             # with no write buffer at all -- a test double, or a foreign
             # transport -- lands here. A hardening knob must not be able to
@@ -543,6 +559,11 @@ class HTTPProtocol(asyncio.Protocol):
             self.transport is None
             or self.transport.is_closing()
             or self._ws_state is not None
+            # Not redundant with _arm_idle_if_free's own is_idle check. A
+            # timer armed while the connection was idle can still be pending
+            # when a new request starts, and the arming site cannot un-fire
+            # it. This is the guard that actually stops a busy connection
+            # being reaped.
             or not self.is_idle
         ):
             return
@@ -804,6 +825,11 @@ class HTTPProtocol(asyncio.Protocol):
         task.add_done_callback(
             functools.partial(self._on_task_done, my_done=my_done, queue=queue)
         )
+        # A deeply pipelined connection is allocating a task, a queue and a
+        # scope per request from a couple of dozen bytes each. Stop reading
+        # from it until the backlog drains.
+        if len(self._inflight_tasks) >= self._pipeline_pause_watermark:
+            self._pause_reading()
 
     def _on_task_done(
         self,
@@ -854,6 +880,10 @@ class HTTPProtocol(asyncio.Protocol):
         _fail_handshake do not route through here (they use a bare discard
         callback) and set _closed anyway, so they cannot re-arm either.
         """
+        self._resume_reading_unless_backed_up(
+            queue_clear=self._current_receive_queue is None
+            or self._current_receive_queue.qsize() <= self._body_resume_watermark
+        )
         if self.is_idle:
             self._arm_idle_timeout()
 
@@ -928,13 +958,9 @@ class HTTPProtocol(asyncio.Protocol):
                 return {"type": "http.disconnect"}
             else:
                 message = await queue.get()
-            if (
-                self._reading_paused
-                and self.transport is not None
-                and queue.qsize() <= self._body_resume_watermark
-            ):
-                self.transport.resume_reading()
-                self._reading_paused = False
+            self._resume_reading_unless_backed_up(
+                queue_clear=queue.qsize() <= self._body_resume_watermark
+            )
             return message
 
         return receive
@@ -947,6 +973,28 @@ class HTTPProtocol(asyncio.Protocol):
             raise RuntimeError("received a body chunk with no active request")
         self._push_to_queue(queue, message, self._body_pause_watermark)
 
+    def _pause_reading(self) -> None:
+        if not self._reading_paused and self.transport is not None:
+            self.transport.pause_reading()
+            self._reading_paused = True
+
+    def _resume_reading_unless_backed_up(self, queue_clear: bool) -> None:
+        """Resume reads only when *every* reason to have paused is gone.
+
+        There are two independent reasons now -- a request's queue over its
+        watermark, and too many application tasks in flight -- and one flag
+        owning the transport's read state. Resuming on one reason while the
+        other still holds is the double-resume bug in a new costume.
+        """
+        if not self._reading_paused or self.transport is None:
+            return
+        if not queue_clear:
+            return
+        if len(self._inflight_tasks) > self._pipeline_resume_watermark:
+            return
+        self.transport.resume_reading()
+        self._reading_paused = False
+
     def _push_to_queue(
         self, queue: asyncio.Queue[Message], message: Message, watermark: int
     ) -> None:
@@ -958,13 +1006,8 @@ class HTTPProtocol(asyncio.Protocol):
         two paths are mutually exclusive anyway.
         """
         queue.put_nowait(message)
-        if (
-            not self._reading_paused
-            and self.transport is not None
-            and queue.qsize() >= watermark
-        ):
-            self.transport.pause_reading()
-            self._reading_paused = True
+        if queue.qsize() >= watermark:
+            self._pause_reading()
 
     # -- websockets --------------------------------------------------------------
 
@@ -1030,6 +1073,19 @@ class HTTPProtocol(asyncio.Protocol):
     def _ws_write(self, data: bytes) -> None:
         if self.transport is not None and not self.transport.is_closing():
             self.transport.write(data)
+
+    def _send_close_frame_once(self, frame: bytes) -> None:
+        """Write a close frame, at most one per connection.
+
+        Six paths can decide to close -- peer close, codec violation, ping
+        timeout, app close, handler return, server shutdown -- and every one
+        of them needs the same guard. Collapsing them here removes five
+        places a future edit could forget it.
+        """
+        if self._ws_close_sent:
+            return
+        self._ws_close_sent = True
+        self._ws_write(frame)
 
     # -- websocket keepalive -------------------------------------------------
 
@@ -1130,9 +1186,7 @@ class HTTPProtocol(asyncio.Protocol):
             # rather than merely being dropped.
             self._defer_ws_close(event.code, event.reason, frame)
             return
-        if not self._ws_close_sent:
-            self._ws_close_sent = True
-            self._ws_write(frame)
+        self._send_close_frame_once(frame)
         self._finish_websocket(event.code, event.reason)
 
     def _ws_abort(self, code: int, reason: str) -> None:
@@ -1142,9 +1196,7 @@ class HTTPProtocol(asyncio.Protocol):
             return
         # CONNECTING (no application has accepted, so there is nobody to give
         # a turn to) or already CLOSING/CLOSED: nothing to defer for.
-        if not self._ws_close_sent:
-            self._ws_close_sent = True
-            self._ws_write(frame)
+        self._send_close_frame_once(frame)
         self._finish_websocket(code, reason)
 
     def _defer_ws_close(self, code: int, reason: str, frame: bytes) -> None:
@@ -1181,9 +1233,7 @@ class HTTPProtocol(asyncio.Protocol):
             return
         code, reason, frame = pending
         self._disarm_ws_close_deadline()
-        if not self._ws_close_sent:
-            self._ws_close_sent = True
-            self._ws_write(frame)
+        self._send_close_frame_once(frame)
         self._finish_websocket(code, reason)
 
     def _disarm_ws_close_deadline(self) -> None:
@@ -1239,9 +1289,8 @@ class HTTPProtocol(asyncio.Protocol):
             # get to relabel it 1001; it only stops waiting for the handler.
             self._flush_ws_close()
             return
-        if self._ws_state is _WSState.CONNECTED and not self._ws_close_sent:
-            self._ws_close_sent = True
-            self._ws_write(
+        if self._ws_state is _WSState.CONNECTED:
+            self._send_close_frame_once(
                 encode_close_frame(CloseCode.GOING_AWAY, "server shutting down")
             )
         self._finish_websocket(CloseCode.GOING_AWAY, "server shutting down")
@@ -1264,9 +1313,7 @@ class HTTPProtocol(asyncio.Protocol):
         elif self._ws_state is _WSState.CONNECTED:
             # A handler that simply returns has ended the session. Without
             # this the socket dangles for the life of the process.
-            if not self._ws_close_sent:
-                self._ws_close_sent = True
-                self._ws_write(encode_close_frame(CloseCode.NORMAL))
+            self._send_close_frame_once(encode_close_frame(CloseCode.NORMAL))
             self._finish_websocket(CloseCode.NORMAL)
         if task.cancelled():
             return
@@ -1388,9 +1435,7 @@ class HTTPProtocol(asyncio.Protocol):
     def _ws_close(self, message: Message) -> None:
         code = int(message.get("code", CloseCode.NORMAL))
         reason = message.get("reason") or ""
-        if not self._ws_close_sent:
-            self._ws_close_sent = True
-            self._ws_write(encode_close_frame(code, reason))
+        self._send_close_frame_once(encode_close_frame(code, reason))
         self._finish_websocket(code, reason)
 
     def _make_ws_receive(self, queue: asyncio.Queue[Message]) -> Receive:
