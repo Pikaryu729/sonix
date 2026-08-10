@@ -19,6 +19,11 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
+from sonix.app.lifespan import (
+    LifespanFactory,
+    LifespanHandler,
+    events_lifespan,
+)
 from sonix.app.middleware import (
     ExceptionHandler,
     HandlerKey,
@@ -84,14 +89,46 @@ class Sonix:
         debug: bool = False,
         middleware: list[Middleware] | None = None,
         exception_handlers: dict[HandlerKey, ExceptionHandler] | None = None,
+        lifespan: LifespanFactory | None = None,
     ) -> None:
         self.router = Router()
         self.debug = debug
+        self._lifespan_factory = lifespan
+        self._on_startup: list[Callable[[], Any]] = []
+        self._on_shutdown: list[Callable[[], Any]] = []
         self._middleware: list[Middleware] = list(middleware or [])
         self._exception_handlers: dict[HandlerKey, ExceptionHandler] = dict(
             exception_handlers or {}
         )
         self._stack: ASGIApp | None = None
+
+    # -- lifespan -------------------------------------------------------------
+
+    def on_startup(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """Sugar for a startup hook with no resource to hand onward."""
+        self._assert_not_started("on_startup")
+        self._on_startup.append(fn)
+        return fn
+
+    def on_shutdown(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        self._assert_not_started("on_shutdown")
+        self._on_shutdown.append(fn)
+        return fn
+
+    def _build_lifespan(self) -> LifespanHandler:
+        if self._lifespan_factory is not None:
+            if self._on_startup or self._on_shutdown:
+                raise RuntimeError(
+                    "pass either lifespan= or on_startup/on_shutdown, not both: "
+                    "combining them makes the ordering between the two "
+                    "ambiguous"
+                )
+            return LifespanHandler(self, self._lifespan_factory)
+        if self._on_startup or self._on_shutdown:
+            return LifespanHandler(
+                self, events_lifespan(self._on_startup, self._on_shutdown)
+            )
+        return LifespanHandler(self)
 
     # -- middleware and exception handlers -----------------------------------
 
@@ -161,12 +198,14 @@ class Sonix:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
+        if scope_type == "lifespan":
+            # This method used to delegate to the router unconditionally, so a
+            # lifespan scope reached Router.__call__ and died on scope["path"]
+            # with a bare KeyError -- meaning a Sonix app could not run under
+            # uvicorn at all, quietly falsifying the two-layer claim.
+            await self._build_lifespan()(scope, receive, send)
+            return
         if scope_type not in ("http", "websocket"):
-            # Previously this method delegated to the router unconditionally,
-            # so a lifespan scope reached Router.__call__ and died on
-            # scope["path"] with a bare KeyError. Lifespan support lands in
-            # app/lifespan.py; until then, fail with something that names the
-            # actual problem.
             raise RuntimeError(f"unsupported ASGI scope type {scope_type!r}")
 
         if self._stack is None:

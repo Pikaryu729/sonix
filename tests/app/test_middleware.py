@@ -406,9 +406,11 @@ class TestScopeTypes:
 
     async def test_unknown_scope_type_names_the_problem(self):
         app = Sonix()
-        # Not a bare KeyError from deep inside the router.
+        # Not a bare KeyError from deep inside the router. ("lifespan" was the
+        # motivating case and is now handled; this covers the remaining
+        # genuinely-unknown types.)
         with pytest.raises(RuntimeError, match="unsupported ASGI scope type"):
-            await app(make_scope(type="lifespan"), fake_receive, make_send()[0])
+            await app(make_scope(type="quic"), fake_receive, make_send()[0])
 
 
 class TestStreamingInterception:
