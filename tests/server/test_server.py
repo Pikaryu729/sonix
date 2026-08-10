@@ -91,6 +91,12 @@ class TestConfig:
             head_timeout=2.5,
             body_pause_watermark=3,
             body_resume_watermark=1,
+            websocket_max_message_size=999,
+            ws_pause_watermark=5,
+            ws_resume_watermark=2,
+            ws_ping_interval=1.5,
+            ws_ping_timeout=0.5,
+            upgrade_protocols=frozenset({"h2c"}),
         )
         protocol = config.protocol_factory(Server(config).state)()
 
@@ -101,6 +107,12 @@ class TestConfig:
         assert protocol._head_timeout == 2.5
         assert protocol._body_pause_watermark == 3
         assert protocol._body_resume_watermark == 1
+        assert protocol._websocket_max_message_size == 999
+        assert protocol._ws_pause_watermark == 5
+        assert protocol._ws_resume_watermark == 2
+        assert protocol._ws_ping_interval == 1.5
+        assert protocol._ws_ping_timeout == 0.5
+        assert protocol._upgrade_protocols == frozenset({"h2c"})
 
     def test_defaults_match_protocol_defaults(self):
         protocol = Config(hello_app).protocol_factory(Server(Config(hello_app)).state)()

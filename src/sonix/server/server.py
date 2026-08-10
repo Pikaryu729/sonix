@@ -27,6 +27,8 @@ from sonix.server.protocol import (
     DEFAULT_BODY_RESUME_WATERMARK,
     DEFAULT_HEAD_TIMEOUT,
     DEFAULT_WS_PAUSE_WATERMARK,
+    DEFAULT_WS_PING_INTERVAL,
+    DEFAULT_WS_PING_TIMEOUT,
     DEFAULT_WS_RESUME_WATERMARK,
     HTTPProtocol,
     ServerState,
@@ -184,6 +186,13 @@ class Config:
     ws_pause_watermark: int = DEFAULT_WS_PAUSE_WATERMARK
     ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK
 
+    # Keepalive. A websocket may be silent for hours and perfectly healthy,
+    # so liveness needs an explicit probe: ping after this much idle time,
+    # and close the connection if no pong follows within the timeout. Either
+    # set to None disables that half.
+    ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL
+    ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT
+
     # Which Upgrade offers actually switch the connection off HTTP. Empty
     # disables upgrades entirely, and any offer not listed is answered as an
     # ordinary HTTP request.
@@ -214,6 +223,8 @@ class Config:
             websocket_max_message_size=self.websocket_max_message_size,
             ws_pause_watermark=self.ws_pause_watermark,
             ws_resume_watermark=self.ws_resume_watermark,
+            ws_ping_interval=self.ws_ping_interval,
+            ws_ping_timeout=self.ws_ping_timeout,
             upgrade_protocols=self.upgrade_protocols,
             server_state=state,
             state=lifespan_state,

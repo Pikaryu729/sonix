@@ -14,6 +14,7 @@ import asyncio
 import enum
 import functools
 import http
+import os
 from typing import cast
 
 from sonix.server.parser import (
@@ -54,6 +55,11 @@ DEFAULT_BODY_PAUSE_WATERMARK = 32
 DEFAULT_BODY_RESUME_WATERMARK = 8
 DEFAULT_WS_PAUSE_WATERMARK = 32
 DEFAULT_WS_RESUME_WATERMARK = 8
+# A websocket connection can stay silent indefinitely and still be perfectly
+# healthy, so a dead peer is invisible without an application-level liveness
+# check. These match uvicorn's --ws-ping-interval/--ws-ping-timeout defaults.
+DEFAULT_WS_PING_INTERVAL = 20.0
+DEFAULT_WS_PING_TIMEOUT = 20.0
 
 _PARSER_ERROR_STATUS: dict[type[HTTPParserError], int] = {
     MalformedRequest: 400,
@@ -260,6 +266,8 @@ class HTTPProtocol(asyncio.Protocol):
         websocket_max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
         ws_pause_watermark: int = DEFAULT_WS_PAUSE_WATERMARK,
         ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK,
+        ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL,
+        ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT,
         upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS,
         server_state: ServerState | None = None,
         state: dict | None = None,
@@ -274,6 +282,8 @@ class HTTPProtocol(asyncio.Protocol):
         self._websocket_max_message_size = websocket_max_message_size
         self._ws_pause_watermark = ws_pause_watermark
         self._ws_resume_watermark = ws_resume_watermark
+        self._ws_ping_interval = ws_ping_interval
+        self._ws_ping_timeout = ws_ping_timeout
         self._upgrade_protocols = upgrade_protocols
         self._server_state = server_state
         self._state = state
@@ -330,6 +340,11 @@ class HTTPProtocol(asyncio.Protocol):
         self._ws_prologue: bytes = b""
         self._ws_close_sent = False
         self._ws_disconnect_message: Message | None = None
+        self._ws_ping_handle: asyncio.TimerHandle | None = None
+        # The payload of the ping we are waiting on a pong for, or None when
+        # no ping is outstanding. Matching on the payload rather than a bare
+        # flag means an unsolicited pong cannot clear a real deadline.
+        self._ws_pending_ping: bytes | None = None
 
         self._head_timeout_handle: asyncio.TimerHandle | None = self._loop.call_later(
             self._head_timeout, self._on_head_timeout
@@ -374,6 +389,7 @@ class HTTPProtocol(asyncio.Protocol):
     def connection_lost(self, exc: Exception | None) -> None:
         self._closed = True
         self._disarm_head_timeout()
+        self._disarm_ws_ping()
         self._disconnected = True
         if self._server_state is not None:
             self._server_state.connections.discard(self)
@@ -752,10 +768,53 @@ class HTTPProtocol(asyncio.Protocol):
         if self.transport is not None and not self.transport.is_closing():
             self.transport.write(data)
 
+    # -- websocket keepalive -------------------------------------------------
+
+    def _arm_ws_ping(self) -> None:
+        """(Re)start the idle countdown to the next server-initiated ping."""
+        self._disarm_ws_ping()
+        if self._ws_ping_interval is None or self._ws_state is not _WSState.CONNECTED:
+            return
+        self._ws_ping_handle = self._loop.call_later(
+            self._ws_ping_interval, self._on_ws_ping_due
+        )
+
+    def _disarm_ws_ping(self) -> None:
+        if self._ws_ping_handle is not None:
+            self._ws_ping_handle.cancel()
+            self._ws_ping_handle = None
+
+    def _on_ws_ping_due(self) -> None:
+        self._ws_ping_handle = None
+        if self._ws_state is not _WSState.CONNECTED:
+            return
+        if self._ws_pending_ping is not None:
+            # The previous ping was never answered within a full interval,
+            # so the peer is gone even though TCP has not noticed.
+            self._ws_abort(CloseCode.INTERNAL_ERROR, "ping timeout")
+            return
+        payload = os.urandom(4)
+        self._ws_pending_ping = payload
+        self._ws_write(encode_frame(Opcode.PING, payload))
+        # The next firing is the timeout for this ping when one is
+        # configured, and otherwise just the next idle interval.
+        delay = (
+            self._ws_ping_timeout
+            if self._ws_ping_timeout is not None
+            else self._ws_ping_interval
+        )
+        if delay is not None:
+            self._ws_ping_handle = self._loop.call_later(delay, self._on_ws_ping_due)
+
     def _ws_data_received(self, data: bytes) -> None:
         parser = self._ws_parser
         if parser is None or self._ws_state is _WSState.CLOSED:
             return
+        # Any inbound byte proves the peer is alive, so a busy connection
+        # never spends anything on keepalive -- and an outstanding ping is
+        # answered by definition, whatever arrived.
+        self._ws_pending_ping = None
+        self._arm_ws_ping()
         try:
             events = parser.feed_data(data)
         except WebSocketProtocolError as exc:
@@ -777,8 +836,10 @@ class HTTPProtocol(asyncio.Protocol):
             # conforming option, and the application never learns it happened.
             self._ws_write(encode_frame(Opcode.PONG, event.data))
         elif isinstance(event, Pong):
-            # Unsolicited pongs are legal and mean nothing to us.
-            pass
+            if event.data == self._ws_pending_ping:
+                self._ws_pending_ping = None
+            # An unsolicited pong is legal and means nothing to us -- and,
+            # because the payload must match, cannot clear a real deadline.
         elif isinstance(event, CloseReceived):
             self._ws_peer_closed(event)
         else:  # pragma: no cover - exhaustive over FrameEvent
@@ -807,6 +868,7 @@ class HTTPProtocol(asyncio.Protocol):
 
     def _finish_websocket(self, code: int, reason: str = "") -> None:
         self._ws_state = _WSState.CLOSED
+        self._disarm_ws_ping()
         # Enqueued *before* closing the transport, so an application blocked
         # in receive() observes the real code rather than the 1006 that
         # connection_lost would otherwise deliver first.
@@ -925,6 +987,7 @@ class HTTPProtocol(asyncio.Protocol):
         if self._reading_paused and self.transport is not None:
             self.transport.resume_reading()
             self._reading_paused = False
+        self._arm_ws_ping()
         prologue, self._ws_prologue = self._ws_prologue, b""
         if prologue:
             self._ws_data_received(prologue)

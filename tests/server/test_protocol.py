@@ -10,6 +10,7 @@ from sonix.server.websockets import (
     CloseReceived,
     FrameParser,
     Opcode,
+    Ping,
     Pong,
     TextMessage,
     encode_frame,
@@ -893,3 +894,82 @@ class TestWebSocketBackpressure:
         protocol.data_received(HANDSHAKE)
         await asyncio.sleep(0.05)
         assert transport.paused is False
+
+
+class TestWebSocketKeepalive:
+    """A websocket may be silent for hours and healthy, so liveness needs a probe."""
+
+    async def test_ping_is_sent_after_an_idle_interval(self):
+        protocol, transport = make_protocol(
+            make_ws_app(), ws_ping_interval=0.05, ws_ping_timeout=None
+        )
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.15)
+        pings = [e for e in server_frames(transport) if isinstance(e, Ping)]
+        assert pings
+
+    async def test_no_ping_while_the_connection_is_busy(self):
+        # Inbound traffic already proves the peer is alive, so a chatty
+        # connection should never spend anything on keepalive.
+        protocol, transport = make_protocol(echo_ws_app, ws_ping_interval=0.1)
+        protocol.data_received(HANDSHAKE)
+        for _ in range(6):
+            await asyncio.sleep(0.03)
+            protocol.data_received(client_frame(Opcode.TEXT, b"tick"))
+        await asyncio.sleep(0.02)
+        assert not [e for e in server_frames(transport) if isinstance(e, Ping)]
+
+    async def test_unanswered_ping_closes_the_connection(self):
+        codes = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            codes.append((await receive())["code"])
+
+        protocol, transport = make_protocol(
+            app, ws_ping_interval=0.05, ws_ping_timeout=0.05
+        )
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.25)
+        assert codes == [1011]
+        assert transport.closed is True
+
+    async def test_a_matching_pong_keeps_the_connection_alive(self):
+        closed = []
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "websocket.accept"})
+            closed.append((await receive())["code"])
+
+        protocol, transport = make_protocol(
+            app, ws_ping_interval=0.05, ws_ping_timeout=0.05
+        )
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.08)
+        pings = [e for e in server_frames(transport) if isinstance(e, Ping)]
+        assert pings
+        protocol.data_received(client_frame(Opcode.PONG, pings[0].data))
+        await asyncio.sleep(0.06)
+        assert closed == []
+
+    async def test_ping_interval_none_disables_keepalive(self):
+        protocol, transport = make_protocol(make_ws_app(), ws_ping_interval=None)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.15)
+        assert not [e for e in server_frames(transport) if isinstance(e, Ping)]
+
+    async def test_no_ping_before_accept(self):
+        # The countdown starts at accept, not at the upgrade head: an app
+        # still deciding has not agreed to speak websocket yet.
+        async def slow_accept(scope, receive, send):
+            await receive()
+            await asyncio.sleep(0.15)
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        protocol, transport = make_protocol(slow_accept, ws_ping_interval=0.05)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.1)
+        assert b"101 Switching Protocols" not in bytes(transport.written)
