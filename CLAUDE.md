@@ -21,7 +21,7 @@ Scope:
 
 `docs/architecture.md` is the reference document for this project: module layout, the design decisions behind each layer, and a 10-step build order. Read it before adding a new subsystem — most structural questions are already answered there, with reasoning.
 
-Built so far (build-order steps 1–8):
+Built so far (build-order steps 1–9):
 
 - `types.py` — shared ASGI type aliases.
 - `server/parser.py` — incremental HTTP/1.1 parser: pure and synchronous, chunked bodies, pipelining, and "reject, never resolve" smuggling defenses.
@@ -33,14 +33,20 @@ Built so far (build-order steps 1–8):
 - `app/middleware.py`, `app/exceptions.py` — ASGI-onion composition and `ExceptionMiddleware`, so a raising handler returns a 500 instead of dropping the connection.
 - `app/lifespan.py` — startup/shutdown, and the `scope["state"]` the server copies into each request.
 - `app/di.py` — `Depends`, plans built once at decoration time, query/path coercion, generator dependencies.
+- `server/websockets.py` — RFC 6455 handshake and frame codec: pure bytes, no `asyncio`, message-level events (fragmentation reassembled internally), and a directional `require_mask` so the same codec drives the test client.
+- `app/websockets.py` — the `WebSocket` a handler sees, built only from `(scope, receive, send)`. **It must never import `server/websockets.py`**: no opcode, mask or frame boundary appears in the app layer, which is why the same handler runs on uvicorn.
 
 Note the build order was **reordered**: middleware and exceptions (originally step 8) landed before DI (originally step 7), because DI's failure modes need somewhere to go. `docs/architecture.md` records this.
 
+The parser owns one more decision than it used to: an upgrade request switches it to a terminal `UPGRADED` state, so HTTP framing stops and no second request head can be emitted. That is a smuggling defense, not bookkeeping — see the "Where an upgrade stops HTTP framing" section in `docs/architecture.md` before touching it.
+
 `uv run sonix` serves a built-in demo on `127.0.0.1:8000`, and `uv run sonix module:app` serves any app, so changes to either layer can be exercised end-to-end with `curl`.
 
-Not yet built: `server/websockets.py`, `app/websockets.py`, the example application, and the hardening/benchmark pass. Modules that don't exist yet are still open design questions — but follow the shape `docs/architecture.md` sketches for them unless there's a reason not to, and update that document if you deviate.
+Not yet built: the example application, and the hardening/benchmark pass (build-order step 10). Follow the shape `docs/architecture.md` sketches unless there's a reason not to, and update that document if you deviate.
 
 `tests/conformance/` needs its own dependency group (`uv run --group conformance pytest tests/conformance`); a plain `uv run pytest` skips it.
+
+`tests/autobahn/` holds the RFC 6455 conformance suite. It runs in CI as a blocking job rather than under pytest, because it ships as a Docker image; `tests/autobahn/README.md` covers running it locally and what is excluded.
 
 ## Commands
 

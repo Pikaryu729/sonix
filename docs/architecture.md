@@ -11,11 +11,11 @@ The boundary is also validated *empirically*, not just structurally. `tests/conf
 
 This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework is built.
 
-**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. Step 7 (middleware and exceptions, swapped ahead of DI — see the [build order](#build-order)) is also done, along with two modules that were not numbered steps at all: a public server API (`Config`, `Server`, `sonix.run`) with a `module:app` CLI, and `app/lifespan.py`. Neither was optional. The server API is a prerequisite for the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo; lifespan fixed a bug that made a Sonix app unable to run under any other ASGI server. `uv run sonix` serves the built-in demo end-to-end over a real socket, and `uvicorn sonix._demo:app` now serves the same app. Step 8 (dependency injection) is done too. WebSockets are designed below but not yet written — that section describes intent, not existing code. Each section marks its own status.
+**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. Step 7 (middleware and exceptions, swapped ahead of DI — see the [build order](#build-order)) is also done, along with two modules that were not numbered steps at all: a public server API (`Config`, `Server`, `sonix.run`) with a `module:app` CLI, and `app/lifespan.py`. Neither was optional. The server API is a prerequisite for the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo; lifespan fixed a bug that made a Sonix app unable to run under any other ASGI server. `uv run sonix` serves the built-in demo end-to-end over a real socket, and `uvicorn sonix._demo:app` now serves the same app. Step 8 (dependency injection) is done too, and so is step 9 (WebSockets): the handshake, the frame codec, the upgrade path through the bridge, `@app.websocket`, and keepalive pings. What remains is step 10 — the hardening pass and published benchmarks. Each section marks its own status.
 
 ## Module layout
 
-Modules marked *(planned)* do not exist yet.
+Every module below exists.
 
 ```
 src/sonix/
@@ -23,7 +23,8 @@ src/sonix/
                           # resolver, and the `sonix` console-script entry point.
                           # Exports Sonix, Request, Response, JSONResponse,
                           # PlainTextResponse, HTMLResponse, Config, Server, run,
-                          # Depends, HTTPException; WebSocket joins them at step 9.
+                          # Depends, HTTPException, WebSocket, WebSocketDisconnect,
+                          # WebSocketException.
   _demo.py                # the app `sonix` serves when given no target. Inside the
                           # package rather than under examples/ so a bare `sonix`
                           # works from an installed wheel with nothing on sys.path.
@@ -39,7 +40,7 @@ src/sonix/
     server.py             # Config/Server: socket binding, serve, graceful shutdown,
                           # signal handling. The server-lifecycle counterpart to
                           # protocol.py's connection lifecycle.
-    websockets.py         # (planned) WS handshake (Sec-WebSocket-Accept) + frame codec —
+    websockets.py         # WS handshake (Sec-WebSocket-Accept) + frame codec —
                           # bytes-only, protocol-level, no ASGI-app concerns
   app/
     __init__.py
@@ -52,7 +53,7 @@ src/sonix/
                           # on_startup/on_shutdown sugar, and the scope["state"] merge
     di.py                 # signature inspection, Depends, resolution plan,
                           # per-request caching
-    websockets.py         # (planned) WebSocket class built purely from (scope, receive, send)
+    websockets.py         # WebSocket class built purely from (scope, receive, send)
     exceptions.py         # HTTPException and friends
 ```
 
@@ -63,7 +64,7 @@ tests/
   server/
     test_parser.py
     test_protocol.py
-    test_websockets.py    # (planned)
+    test_websockets.py
   app/
     test_requests.py
     test_responses.py
@@ -72,10 +73,15 @@ tests/
     test_middleware.py
     test_lifespan.py
     test_di.py
-    test_websockets.py    # (planned)
+    test_websockets.py
     test_exceptions.py
   test_types.py           # the shared ASGI aliases stay exported under their known names
   test_layering.py        # architecture conformance: fails if sonix/app/** imports sonix.server
+  wsclient.py             # a minimal RFC 6455 client built on the server's own codec
+  test_websocket_end_to_end.py
+                          # the one module that spans both layers, over a real socket
+  conformance/            # FastAPI/Starlette on Sonix, and Sonix under uvicorn
+  autobahn/               # the RFC 6455 conformance suite, driven from outside in CI
 ```
 
 `pyproject.toml` declares `dependencies = []`, and that empty list is a design constraint rather than an oversight: anything appearing there that isn't dev tooling is a bug against the project's premise.
@@ -88,9 +94,20 @@ An incremental state-machine parser (`START_LINE → HEADERS → BODY → COMPLE
 
 ```python
 class HTTP11Parser:
-    def __init__(self, *, max_header_size=..., max_headers=..., max_body_size=...): ...
+    def __init__(
+        self,
+        *,
+        max_header_size=...,
+        max_headers=...,
+        max_body_size=...,
+        upgrade_protocols=frozenset({"websocket"}),
+    ): ...
     def feed_data(self, data: bytes) -> list[Event]: ...
     def feed_eof(self) -> None: ...
+    def take_buffer(self) -> bytes: ...  # only after an upgrade; see below
+
+    @property
+    def upgraded(self) -> bool: ...
 
 
 class HTTPParserError(Exception): ...
@@ -102,7 +119,7 @@ class MalformedRequest(HTTPParserError): ...
 class RequestTooLarge(HTTPParserError): ...
 ```
 
-Events are small dataclasses: `RequestHeadComplete(head)`, `BodyChunk(data, more_body)`, `RequestComplete()`.
+Events are small dataclasses: `RequestHeadComplete(head)`, `BodyChunk(data, more_body)`, `RequestComplete()`. `head.upgrade` carries the lowercased `Upgrade` token when the request switches the connection off HTTP, and `None` otherwise.
 
 **Resource-exhaustion defense:** header and body size limits are enforced *during accumulation*, not after the full request has been buffered. "Buffer everything, then check" is the vulnerability, not a mitigation of it.
 
@@ -112,6 +129,29 @@ Events are small dataclasses: `RequestHeadComplete(head)`, `BodyChunk(data, more
 - `Transfer-Encoding` present but not exactly `chunked` (odd casing, extra codings, whitespace tricks) → reject.
 - Header folding / `obs-fold` continuation lines → reject rather than join. RFC 9112 §5.2 permits either rejecting or replacing with a space; rejecting is the stricter choice and consistent with this project's "reject, don't resolve" posture throughout.
 - Malformed request line (bad method token, missing SP, control characters, wrong token count) → 400.
+
+#### Where an upgrade stops HTTP framing
+
+An upgrade request means this connection stops speaking HTTP. That is a framing decision, so it is made here — and deciding it a layer up would be too late anyway. `feed_data` runs to exhaustion before returning, so by the time `protocol.py` could inspect the head's headers, the bytes after the handshake have already been parsed as though they were another request.
+
+That is not a theoretical ordering concern; it is a fourth smuggling case. Given
+
+```
+GET /ws HTTP/1.1 ... Upgrade: websocket\r\n\r\n
+GET /admin HTTP/1.1\r\nHost: x\r\n\r\n
+```
+
+in a single segment, a parser with no notion of upgrades emits **two** `RequestHeadComplete` events and the bridge dispatches both — running a second, invisible request on a connection the client believes is an opaque tunnel. The upgrade is the desync primitive.
+
+The defense is structural rather than a check. A terminal `UPGRADED` state emits the head and then nothing: no `BodyChunk`, no `RequestComplete`, no reset. No second request head can exist, so there is nothing for the bridge to dispatch. The trailing bytes stay inert in the buffer until someone deliberately asks for them with `take_buffer()` — which is also what stops a client that sends its first frame in the same segment from silently losing it.
+
+Two supporting decisions:
+
+- `head.upgrade` is a **token**, not a bool, so `protocol.py` can say "I only implement `websocket`" by comparing a value the parser handed it rather than re-tokenizing the header itself — which would be exactly the duplicated framing decision this module exists to prevent.
+- `upgrade_protocols` decides which offers actually stop framing. An offer this server does not implement (`Upgrade: h2c` with `h2c` absent) leaves `head.upgrade` as `None` and the request is answered normally, which is what RFC 9110 §7.8 prescribes. So the parser owns the framing *consequence* without knowing any protocol's *semantics*.
+- A **body on an upgrade request is rejected** (a `Content-Length` of 0 is unambiguous and stays allowed). The bytes after the head would otherwise be ambiguously body or post-upgrade data — the two-readers-disagree case in its purest form.
+
+Note that `protocol.py` keeps its own `Connection` tokenizer for `close`/`keep-alive`. That is deliberate and not a duplicated framing decision: connection *reuse* is a different question from where a request ends.
 
 **Pipelining:** a single `feed_data()` call must be able to return events for more than one complete request. Leftover bytes remain in the parser's internal buffer for the next request cycle rather than being discarded — independently testable by feeding two concatenated requests and asserting two `RequestComplete` sequences, with zero event-loop involvement.
 
@@ -182,14 +222,46 @@ beyond ergonomics: it lets the benchmark harness launch Sonix and uvicorn with
 structurally identical command lines, so the comparison isn't quietly measuring two
 different startup paths.
 
-### `server/websockets.py` — handshake and frame codec *(planned)*
+### `server/websockets.py` — handshake and frame codec *(implemented)*
 
-Protocol-level only, no application-facing API:
+Protocol-level only, no application-facing API, and no `asyncio` import — the same posture as `parser.py`, and testable the same way: 110 tests that never touch an event loop.
 
-- On seeing `Upgrade: websocket` + `Connection: Upgrade` + `Sec-WebSocket-Key` on a `GET`, compute `Sec-WebSocket-Accept = base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))` using stdlib `hashlib`/`base64`, write `101 Switching Protocols`, then switch the connection from the HTTP message pump to a frame-based one.
-- Frame codec as pure functions on bytes — unit-testable exactly like the HTTP parser, no event loop required: `encode_frame` (server frames are always unmasked) and `decode_frame` (client frames **must** be masked; unmasked client frames are rejected outright, per RFC 6455).
-- Control frames handled inline: ping → pong, close → echo-close then close the transport.
-- A max frame/message size is enforced, with oversized frames rejected via close code 1009 rather than buffered without bound — the DoS defense for WebSocket connections.
+```python
+class FrameParser:
+    def __init__(self, *, max_message_size=..., require_mask=True): ...
+    def feed_data(self, data: bytes) -> list[FrameEvent]: ...
+
+    @property
+    def closed(self) -> bool: ...
+
+
+def encode_frame(opcode, payload, *, fin=True, mask=None) -> bytes: ...
+def encode_close_frame(code, reason="", *, mask=None) -> bytes: ...
+def accept_key(sec_websocket_key) -> bytes: ...
+def validate_handshake(headers) -> bytes: ...  # raises HandshakeError(status, headers)
+def encode_handshake_response(key, subprotocol, extra_headers) -> bytes: ...
+```
+
+Events are `TextMessage`, `BinaryMessage`, `Ping`, `Pong`, `CloseReceived(code, reason)`.
+
+**Four deviations from this document's earlier sketch, and why.**
+
+1. *A `FrameParser` class for reading, not a free `decode_frame`.* Decoding is stateful across calls — partial frames spanning TCP segments, continuation reassembly, per-message size accounting — so a free function would push "do I have a whole frame yet?" up into `protocol.py`. That is the mistake `HTTP11Parser` exists to prevent, one layer down. Encoding genuinely is stateless and stays a free function.
+2. *The parser emits **messages**, not frames.* Fragmentation is reassembled here, so `protocol.py` never sees a `CONTINUATION` opcode and never decides where a message ends — the frame-level analogue of "protocol.py never re-inspects headers".
+3. *`require_mask` and `encode_frame(mask=...)` are parameters rather than hardcoded.* The RFC's masking rule is **directional**: a client must mask, a server must not. Making it a parameter lets the same codec drive a client, which is what `tests/wsclient.py` is, instead of a second decoder that could share this one's bugs. A test pins that a server frame never sets the MASK bit.
+4. *The handshake is **app-driven**, so this module does not write `101` on sight of the headers.* The sketch had it the other way round, which is not implementable under ASGI: the server sends `websocket.connect` and the **application** answers `accept` (→ 101) or `close` (→ HTTP 403), because only the application can reject a connection or choose a subprotocol. Getting this backwards would make Starlette's WebSocket support unrunnable on Sonix.
+
+**Enforcement**, each with a named test — close code **1002** for an unmasked client frame, any RSV bit (we negotiate no extensions, ever), a reserved opcode, an oversized or fragmented control frame, a data frame interrupting a fragmented message, a continuation with none in progress, a 64-bit length with the sign bit set, a one-byte close payload, or an invalid close code; **1007** for text or a close reason that is not valid UTF-8; **1009** for exceeding `max_message_size`.
+
+Three details that make those correct rather than merely present:
+
+- The size limit is checked against the frame's **declared** length, not after accumulating. A peer announcing a terabyte and sending nothing must be refused immediately, not buffered toward forever.
+- UTF-8 is validated on the **reassembled message**, not per fragment. A multi-byte character may legitimately straddle a fragment boundary, and per-fragment validation rejects correct traffic. Autobahn classes this as `NON-STRICT` rather than a failure; fail-fast incremental validation is a step-10 item.
+- `encode_close_frame` truncates an over-long reason on a character boundary. A control frame carries 125 bytes and an `HTTPException.detail` routinely runs past that; raising while trying to report an error is no answer.
+
+The 101 response has its own encoder rather than reusing `protocol.py`'s, which always appends a `Connection: keep-alive`/`close` header. On a 101 that header is wrong and strict clients reject the upgrade over it.
+
+**Verified from outside.** The [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite) runs ~500 RFC 6455 cases against a Sonix echo server as a blocking CI job, and an unmodified Starlette WebSocket application driven by the independently written `websockets` client runs on Sonix's server in the conformance suite. Our own tests can only show the codec agrees with itself.
 
 ## The ASGI bridge (`types.py` + bridge logic in `server/protocol.py`)
 
@@ -214,11 +286,48 @@ Concrete HTTP scope:
 }
 ```
 
+Concrete websocket scope — note there is **no `method` key**, which is precisely what breaks anything reading `scope["method"]` unconditionally:
+
+```python
+{
+    "type": "websocket",
+    "asgi": {"version": "3.0", "spec_version": "2.3"},
+    "http_version": "1.1",
+    "scheme": "ws",
+    "path": "/rooms/42",
+    "raw_path": b"/rooms/42",
+    "query_string": b"token=abc",
+    "root_path": "",
+    "headers": [(b"host", b"example.com"), ...],
+    "client": (host, port),
+    "server": (host, port),
+    "subprotocols": ["chat", "superchat"],
+}
+```
+
+Reading `Sec-WebSocket-Protocol` to build that last key is application metadata, not a framing conclusion — it says nothing about where bytes begin or end — so it does not trespass on the parser's territory.
+
 Sequencing guarantees are enforced defensively at the bridge, not just assumed:
 
 - The first message `send()` receives for a request must be `http.response.start`; sending `http.response.body` first is a bridge-level error rather than being silently accepted.
 - `more_body` is respected in both directions — body chunks stream through `receive()` progressively rather than requiring the bridge to fully buffer the body before invoking the application. An app-layer `await request.body()` convenience can drain the queue itself if it wants "just give me all the bytes."
 - Calling `receive()` again after the body has been fully consumed and the client has disconnected must return `http.disconnect`, not hang.
+
+### The websocket half of the bridge
+
+The connection runs a three-state machine — `CONNECTING → CONNECTED → CLOSED` — and the application's whole vocabulary is `websocket.connect` / `accept` / `receive` / `send` / `close` / `disconnect`. No opcode, mask or frame boundary crosses the boundary, which is what makes the layering rule hold structurally rather than by discipline.
+
+**The upgrade is a connection mode switch, not a kind of request.** `HTTP11Parser` is never fed again; bytes go to the frame parser. That one decision resolves the write turnstile for free: the websocket task holds a turnstile it never releases, which is inert *only because* the parser guarantees no successor request can exist to wait on it. It still takes the turnstile, so a response pipelined ahead of the handshake lands before the 101. (`_fail` explicitly refuses to run in websocket mode — it is unreachable, but reaching it would await an `Event` nobody will ever set.)
+
+**Close handling and ping/pong live here, invisible to the application.** ASGI defines no `websocket.ping` message, so auto-pong is the only conforming answer rather than a preference. An inbound close is echoed — payloadless when the peer sent no code, since 1005 is a report-only sentinel — and the disconnect is enqueued **before** the transport closes, so an application blocked in `receive()` sees the real code instead of the 1006 that `connection_lost` would otherwise deliver first. A handler that simply returns gets a 1000; without that the socket dangles for the life of the process.
+
+Disconnect codes: the peer's code, or 1005 when its close was payloadless; 1006 when the transport vanished without a close; the codec's code on a protocol violation; 1001 on server shutdown.
+
+**Keepalive.** A websocket may be silent for hours and healthy, so `ws_ping_interval`/`ws_ping_timeout` probe it: ping after idle, close 1011 if no matching pong follows. The timer re-arms on any inbound byte, so a busy connection never pings; pongs are matched on payload, so an unsolicited one — which the RFC permits — cannot clear a real deadline; and the countdown starts at `accept`, not at the upgrade head, because an application still deciding has not agreed to speak websocket yet.
+
+**Graceful shutdown closes websockets actively rather than draining them.** A websocket connection is never idle, so the drain would burn the whole deadline and then hand the client a bare TCP close. `is_idle` is deliberately left alone — such a connection is honestly busy — and the server sends 1001 up front, after which the handler returns within a tick.
+
+**Non-goal:** the `websocket.http.response` denial-response extension. It is an ASGI extension usable only when the server advertises it, and a plain pre-accept `websocket.close` already yields the spec-mandated 403. Adding it later is purely additive: advertise the key, add a state.
 
 ## Layer 2 — `app/` (the "Starlette/FastAPI" layer)
 
@@ -231,6 +340,13 @@ Sequencing guarantees are enforced defensively at the bridge, not just assumed:
 ### `app/routing.py` *(implemented)*
 
 A linear list of compiled route patterns, evaluated in registration order — **not a trie**. A trie wins asymptotically on lookup, but correctly tracking "the path shape matched, but the method didn't" (needed to distinguish 404 from 405) through a trie walk adds real implementation complexity, and at the route counts a project like this will realistically see, the parser/protocol layer — not routing — is where benchmark time is actually spent. This also matches what Starlette/FastAPI themselves do, which keeps a `wrk` comparison focused on the part of Sonix that's actually novel (the hand-rolled server and parser) rather than comparing two different routing data structures.
+
+**Matching considers scope type as well as path**, via a `scope_type` field on `Route` (websocket routes carry `methods=()`). So `@app.get("/x")` and `@app.websocket("/x")` coexist without colliding. Overloading `methods=None` was rejected — `add_route` already reads it as "default to GET", and a third meaning makes `Route(..., methods=None)` genuinely ambiguous — as was a second route list, which would split the registration-order-first-match-wins invariant across two orderings.
+
+Two consequences worth stating rather than discovering:
+
+- **An HTTP request to a websocket-only path is a 404, not a 405.** The HTTP loop skips non-HTTP routes explicitly. It would 404 by accident anyway (an empty `methods` tuple contributes nothing to `Allow`), but relying on that is one refactor away from a 405 carrying an empty `Allow` header, which claims the path exists over HTTP with no usable method.
+- **"No such websocket path" is deliberately not observable as a 404.** A websocket has no status line to put one on, so the router raises `WebSocketException(1000)` and the exception layer turns it into a close — which, before accept, reaches the client as the HTTP 403 that ASGI mandates for a denied handshake. Starlette on uvicorn behaves the same way.
 
 - Path templates such as `/items/{id:int}` are compiled once at registration time into a regex with named groups, plus a converter registry (`str` by default, excluding `/`; `int`, `float`, `uuid`; `path` for catch-all segments). Coercion happens *as part of matching* — the `int` converter's regex is a numeric character class, not `.+` — so "the path shape matched but the segment couldn't be coerced" is not a reachable state; a non-numeric segment simply fails to match that route and falls through.
 - **Trailing slash:** strict, no implicit redirect. `/items` and `/items/` are distinct routes. Implicit redirect-on-trailing-slash (as Starlette/FastAPI default to) is a known source of subtlety, including POST body loss across a misconfigured redirect; it can be offered later as an opt-in, not as core behavior.
@@ -268,6 +384,8 @@ Detecting only the raising case is not enough. Returning early on an unrecognize
 
 `app/requests.py` deliberately still raises `ClientDisconnect` rather than an `HTTPException`, keeping that module ignorant of status codes; mapping it is the middleware's job.
 
+`WebSocketException(code=1008, reason="")` is its websocket counterpart, and is deliberately **not** an `HTTPException` subclass: a close code is not a status code, and the handler registry walks the MRO — inheriting would hand it to a handler that returns an HTTP `Response`, which a websocket has nowhere to put. Its `ClientDisconnect` counterpart, `WebSocketDisconnect(code, reason)`, lives in `app/websockets.py` beside the class that raises it.
+
 ### `app/middleware.py` *(implemented)*
 
 **ASGI-onion wrapping**: each middleware is `middleware(app) -> new_app`, where `new_app.__call__(scope, receive, send)` does pre-work, awaits the inner app (optionally wrapping `receive`/`send` to observe or transform messages), then does post-work. This is deliberately not a before/after hook list — a hook list can't express streaming interception of a response body that arrives as multiple `http.response.body` events, whereas onion wrapping is a single composition model shared with the server bridge and the router, rather than a second one to learn.
@@ -287,6 +405,10 @@ class SomeMiddleware:
 The stack is built **once, lazily, on the first request**, because it cannot be assembled until every route and middleware is registered. Registering middleware or an exception handler after that point raises, rather than silently having no effect.
 
 The built-in `ExceptionMiddleware` catches `HTTPException` and converts it to a `Response`, and catches unhandled exceptions and converts them to a 500 (with a debug flag to re-raise instead, for tests). This is what turns a DI failure or a handler bug into an HTTP response instead of a crashed connection. It sits **outermost**, so it also catches failures raised by other middleware, not only by handlers.
+
+**Websocket scopes get their own branch in the same class**, not a second middleware: one stack position, one registry, one lookup. It maps `WebSocketException` to a close with its code, an `HTTPException` to a close 1008 carrying the detail (the motivating case is a dependency-injection 422 on a websocket query string, which would otherwise leave the client waiting forever), anything else to a logged traceback and a close 1011, and a `WebSocketDisconnect` to a quiet return because there is nobody left to answer.
+
+**User exception handlers stay HTTP-only**, which is a real limitation rather than an oversight: `ExceptionHandler` returns a `Response`. Inventing a second handler protocol and a second registry for something nothing yet needs is worse than saying so; adding a parallel websocket registry later is purely additive.
 
 Two details that only became apparent once it existed:
 
@@ -310,7 +432,7 @@ The canonical dependency marker is `Annotated[X, Depends(get_db)]`, with a defau
 *Classification precedence*, decided per parameter at decoration time:
 
 1. `Depends(...)` marker — resolved recursively, with sub-dependencies following the same rules.
-2. Special types — `Request` (`WebSocket` joins it at step 9).
+2. The connection object — `Request` on an HTTP route, `WebSocket` on a websocket one.
 3. Path parameters — taken from the dict routing has already coerced.
 4. Query parameters — coerced according to the annotation.
 
@@ -334,22 +456,39 @@ Sync dependency callables run via `asyncio.to_thread`. Sync *generator* dependen
 
 **Failure mode:** a parameter with an unsupported annotation and no `Depends`, a variadic or positional-only parameter, an annotation disagreeing with the path template, two `Depends` on one parameter, or a dependency cycle — all raise `DependencyResolutionError` naming the handler and parameter **at decoration time** (when `@app.get(...)` executes), not at request time. Note the failure condition is *unsupported annotation*, not "no query parameter matched": every parameter name is a potential query parameter, so whether one will match is unknowable until a request arrives. Runtime failures inside a dependency callable propagate as ordinary exceptions through `ExceptionMiddleware` into a 500.
 
+**Websockets need almost nothing here.** `Request` and `WebSocket` share an `HTTPConnection` base holding the scope-derived read-only surface, and resolution only ever reads `query_params` and `path_params` — so `resolve()` is typed against that base and there is no websocket branch anywhere in the module. A websocket handler gets path and query injection for free, and `async def handler(websocket: WebSocket)` even takes the existing `is_trivial` fast path.
+
+`build_plan` takes the scope type, so declaring the wrong connection object is a **decoration-time** error rather than an `AttributeError` on the first connection, and it threads through the `Depends` recursion so a sub-dependency asking for a `Request` on a websocket route is caught too. Both unannotated spellings are errors as well, and that arm is the load-bearing one: `def handler(request)` on a websocket route would otherwise classify as a required string query parameter and reject every connection with a 422 — a silent misreading of code that looks perfectly fine.
+
+**A sync websocket handler is refused at decoration.** Not a style rule: a sync handler runs in `asyncio.to_thread`, and every method on `WebSocket` is a coroutine, so such a handler could do nothing at all with its only argument. A sync HTTP handler at least computes and returns a value.
+
 **A Python limitation worth knowing.** Under `from __future__ import annotations` (PEP 563) an annotation is a string that `get_type_hints` evaluates against the defining module's globals, so `Annotated[X, Depends(f)]` where `f` is a *local* cannot be resolved — the name lives nowhere the evaluator can see. Module-level dependencies, which is what applications write, are unaffected. Sonix reports this as a `DependencyResolutionError` naming the handler rather than letting a bare `NameError` escape at import time.
 
-### `app/websockets.py` *(planned)*
+### `app/websockets.py` *(implemented)*
 
 A `WebSocket` class built purely from `(scope, receive, send)`:
 
 ```python
-await ws.accept()
-await ws.receive_text() / await ws.receive_bytes() / await ws.receive_json()
-await ws.send_text(...) / await ws.send_bytes(...)
-await ws.close(code=...)
+await ws.accept(subprotocol=None, headers=None)
+await ws.receive() / receive_text() / receive_bytes() / receive_json()
+async for message in ws.iter_text():
+    ...  # or iter_bytes()
+await ws.send_text(...) / send_bytes(...) / send_json(...)
+await ws.close(code=1000, reason="")
 ```
 
-Because this class only ever touches `scope`/`receive`/`send`, it is fully runtime-agnostic even though the underlying handshake and frame mechanics live in `server/websockets.py` — a direct, concrete validation of the two-layer design's central claim.
+**This module may not import `sonix.server`, and specifically not `server/websockets.py`.** No opcode, mask byte, frame boundary or fragmentation rule appears anywhere in it — the vocabulary is entirely ASGI `websocket.*` messages. That is the most concrete payoff of the two-layer design, and it is why the same handler runs unchanged on uvicorn while an unmodified Starlette WebSocket application runs on Sonix's server. Both directions are in the conformance suite, and `tests/test_layering.py` walks this file's AST to enforce the rule.
 
-`@app.websocket("/ws")` reuses `app/routing.py`'s `Router`, matching on path **and** `scope["type"]`, so an HTTP-only route and a WebSocket-only route can share the same path without colliding.
+(Close *codes* do appear, because they are part of the ASGI message contract — `websocket.close` carries one, `websocket.disconnect` reports one — not part of the frame format.)
+
+Two design points that are not decoration:
+
+- **`accept()` consumes `websocket.connect` itself.** ASGI requires the application to receive it before answering, and doing that here rather than making every handler open with a bare `await ws.receive()` is most of why this class earns its place over raw `send`/`receive`.
+- **`close()` is idempotent.** `finally: await ws.close()` is the standard shape of a websocket handler and must not raise because the peer closed first.
+
+A disconnect raises `WebSocketDisconnect(code, reason)` rather than returning a sentinel, so an echo loop reads as a loop and ends by exception; `iter_text()`/`iter_bytes()` wrap that into the idiomatic `async for`. A *type* mismatch — `receive_text()` on a binary message — is a `RuntimeError` instead, because that is a bug in one of the two peers rather than a reason to close.
+
+`@app.websocket("/ws")` reuses `app/routing.py`'s `Router`, matching on path **and** `scope["type"]`, so an HTTP-only route and a WebSocket-only route share the same path without colliding.
 
 ### `app/applications.py` and the public API *(implemented, first pass)*
 
@@ -362,7 +501,7 @@ What `@app.get("/items/{id}")` wires up, end to end:
 3. **Response construction.** A handler may return a `Response` instance directly, or a plain value (`dict`/`list`/`str`/`None`), which dispatch wraps into a default `JSONResponse` or `PlainTextResponse`. This keeps FastAPI's "just return a dict" ergonomics without pydantic: serialization is a straightforward `json.dumps` over dict/list/dataclass/primitive values. Request-body model validation is explicitly out of scope for this document — at most a future stretch goal built on stdlib `dataclasses`.
 4. **Sending.** `Response` is itself an ASGI callable — `__call__(scope, receive, send)` emits `http.response.start` then `http.response.body` — so dispatch's final step is uniformly `await response(scope, receive, send)`, whether the handler returned a `Response` directly or dispatch constructed one.
 
-**Public API**, re-exported from `sonix/__init__.py`: `Sonix`, `Request`, `Response`, `JSONResponse`, `PlainTextResponse`, `HTMLResponse`, `Depends`, `WebSocket`, `HTTPException`. Handler authors never import `sonix.server` or `sonix.parser` directly — everything they need comes from the top-level package or `sonix.app`.
+**Public API**, re-exported from `sonix/__init__.py`: `Sonix`, `Request`, `Response`, `JSONResponse`, `PlainTextResponse`, `HTMLResponse`, `Depends`, `WebSocket`, `WebSocketDisconnect`, `HTTPException`, `WebSocketException`. Handler authors never import `sonix.server` or `sonix.parser` directly — everything they need comes from the top-level package or `sonix.app`.
 
 ## Build order
 
@@ -376,8 +515,8 @@ The build order is chosen so that each step is independently testable or demoabl
 6. ✅ **`app/applications.py`** (first pass, no DI or middleware yet) — `Sonix` plus `@app.get`, wired to `server/protocol.py`. This is the first real `curl`-against-a-running-server milestone, and the first point worth taking a `wrk` benchmark checkpoint.
 7. ✅ **`app/middleware.py`** (with `ExceptionMiddleware` and `app/exceptions.py`) — onion composition tested against fake inner apps. **Swapped with DI from this document's original order.** DI's failure modes — a missing query parameter becoming a 422, a dependency callable raising — have nowhere to go without an exception layer, so building DI first would mean building it against a hole. `app/lifespan.py` landed alongside, since both required `Sonix.__call__` to switch on `scope["type"]` rather than delegate blindly.
 8. ✅ **`app/di.py`** — signature inspection, plan-building, and caching, unit-tested with fake handlers and scopes, then wired into dispatch. Two additions beyond the original design: generator (`yield`) dependencies with an `AsyncExitStack`, without which `Depends(get_db)` is a demo rather than a usable feature; and precomputed fast-path flags on the plan, without which step 10's benchmark would have measured an `AsyncExitStack` allocated per request for handlers that need none.
-9. ⬜ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`.
-10. ⬜ **Hardening pass** — header/body/backlog size limits, slow-loris timeouts, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code.
+9. ✅ **`server/websockets.py`** + **`app/websockets.py`** — handshake and frame codec unit-tested purely on bytes (like the HTTP parser), then wired into `protocol.py`'s upgrade path and `applications.py`'s `@app.websocket`. Three things arrived beyond the original sketch, each because leaving it out would have been a bug rather than a simplification: a terminal `UPGRADED` state in the parser, which turned out to close a smuggling hole; active close-with-1001 on shutdown, because a websocket is never idle and would otherwise burn the whole drain deadline; and `require_mask`/`mask=` on the codec, which makes it usable as a client and so lets the tests drive it from both ends.
+10. ⬜ **Hardening pass** — a re-armable keep-alive/idle timeout (the current one covers only the first request head, and must stay conditional on the connection still being in HTTP mode), `set_write_buffer_limits()`, `Date`/`Server` response headers, a `wrk` benchmark against FastAPI+uvicorn, and a pass of the findings through code review and security review against the real, now-existing code. Carried here from step 9: fail-fast incremental UTF-8 validation (the Autobahn `NON-STRICT` cases), `permessage-deflate` (an explicit non-goal, not a gap), and the O(n) buffer front-deletion both parsers share.
 
 This yields two concrete demoable milestones along the way — step 3's raw HTTP round trip and step 6's first real `@app.get` — instead of one big-bang integration at the very end. Both have now landed: `uv run sonix` serves a demo app with `@app.get("/")` and `@app.get("/items/{item_id:int}")` over a real socket.
 

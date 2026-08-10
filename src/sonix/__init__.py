@@ -14,10 +14,11 @@ import sys
 
 from sonix.app.applications import Sonix
 from sonix.app.di import Depends
-from sonix.app.exceptions import HTTPException, ValidationError
+from sonix.app.exceptions import HTTPException, ValidationError, WebSocketException
 from sonix.app.middleware import Middleware
 from sonix.app.requests import Request
 from sonix.app.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from sonix.app.websockets import WebSocket, WebSocketDisconnect
 from sonix.server.protocol import HTTPProtocol
 from sonix.server.server import DEFAULT_HOST, DEFAULT_PORT, Config, Server, run
 from sonix.types import ASGIApp
@@ -37,6 +38,9 @@ __all__ = [
     "Server",
     "Sonix",
     "ValidationError",
+    "WebSocket",
+    "WebSocketDisconnect",
+    "WebSocketException",
     "main",
     "run",
 ]

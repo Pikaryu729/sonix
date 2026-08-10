@@ -10,13 +10,14 @@ server underneath it.**
 
 Sonix is not a wrapper around uvicorn. It implements the whole stack: the
 HTTP/1.1 parser, the `asyncio.Protocol` connection handling, the ASGI bridge,
-routing, and the request/response objects. The goal is to make explicit what a
+the WebSocket frame codec, routing, dependency injection, and the
+request/response objects. The goal is to make explicit what a
 decorator like `@app.get(...)` actually *does* — route registration, request
 parsing, handler dispatch, response serialization — rather than to add another
 framework to the ecosystem.
 
 ```python
-from sonix import Sonix, Request
+from sonix import Request, Sonix, WebSocket
 
 app = Sonix()
 
@@ -31,6 +32,15 @@ async def get_item(request: Request) -> dict:
     # item_id is already coerced to int -- a non-numeric segment never
     # matched this route in the first place.
     return {"item_id": request.path_params["item_id"]}
+
+
+@app.websocket("/rooms/{room:int}")
+async def room(websocket: WebSocket, room: int) -> None:
+    # Same routing and same dependency injection as an HTTP handler; the
+    # frames underneath are Sonix's own.
+    await websocket.accept()
+    async for message in websocket.iter_text():
+        await websocket.send_text(f"[{room}] {message}")
 ```
 
 ```console
@@ -58,6 +68,16 @@ Everything below the application code. Specifically:
   real backpressure and slow-loris defense require.
 - **A write turnstile** so pipelined requests, which run as concurrent tasks,
   still have their responses written back in request order.
+- **A WebSocket implementation** (`server/websockets.py`) — the handshake, the
+  frame codec, masking, fragmentation reassembly, control-frame handling and
+  the close handshake, all written against RFC 6455 and unit-tested purely on
+  bytes. It is checked from the outside by the
+  [Autobahn|Testsuite](tests/autobahn/), which CI runs as a blocking job.
+- **An upgrade that stops HTTP framing**, which turns out to be a
+  request-smuggling defense rather than bookkeeping. A request pipelined
+  behind a handshake would otherwise be dispatched as a genuine request on a
+  connection the client believes is an opaque tunnel; the parser makes that
+  structurally impossible by refusing to emit a second request head.
 - **Routing** with compiled path templates, typed path parameters
   (`{id:int}`, `{name:str}`, `{rest:path}`), and a correct 404-vs-405
   distinction that accumulates an `Allow` header from every route that matched
@@ -81,14 +101,27 @@ The interesting constraint is that **`sonix/app/**` may never import
 `sonix.server`**. That is not a code-review convention; `tests/test_layering.py`
 walks the AST of every module under `app/` and fails if one does.
 
+WebSockets are where that pays off most concretely. `app/websockets.py` cannot
+import the frame codec, so no opcode, mask byte or fragment boundary appears
+anywhere in the application layer — a handler speaks only ASGI `websocket.*`
+messages. That is why the same `@app.websocket` handler runs unchanged on
+uvicorn, and why an unmodified Starlette WebSocket application runs on Sonix's
+server. Both directions are tested.
+
 The payoff is checked rather than asserted. CI runs a conformance suite in
 **both directions**:
 
 - **FastAPI and Starlette applications, unmodified, served by Sonix's HTTP
   server** — including request bodies, streaming responses with no
   `Content-Length`, background tasks, and a client that disconnects mid-stream.
+- **Starlette WebSocket applications on Sonix's server**, driven by the
+  independently written `websockets` client: fragmentation, subprotocol
+  negotiation, close codes, and ping/pong.
 - **A Sonix application served by uvicorn**, launched in a subprocess with an
-  import string exactly as a deployment would.
+  import string exactly as a deployment would — HTTP routes and
+  `@app.websocket` routes alike.
+- **The Autobahn|Testsuite**, ~500 RFC 6455 cases driven against a Sonix echo
+  server from outside, failing the build on any case that is not OK.
 
 Passing your own unit tests shows the code agrees with itself. Running someone
 else's framework shows it agrees with the spec.
@@ -174,8 +207,8 @@ for the design and the reasoning behind it.
 | ✅ | 1–2 | ASGI type contract, HTTP/1.1 parser |
 | ✅ | 3 | `asyncio.Protocol` server and ASGI bridge |
 | ✅ | 4–6 | Requests, responses, routing, the `Sonix` app class |
-| ⬜ | 7–8 | Dependency injection, middleware and exception handling |
-| ⬜ | 9 | WebSockets |
+| ✅ | 7–8 | Middleware, exception handling, dependency injection |
+| ✅ | 9 | WebSockets |
 | ⬜ | 10 | Hardening pass and published benchmarks |
 
 ## Limitations and non-goals
@@ -189,6 +222,9 @@ scope rather than merely unbuilt:
   story; there is no pydantic equivalent and there will not be one.
 - **No OpenAPI schema generation.** Large surface area, and it would say very
   little about the systems-level questions this project exists to answer.
+- **No WebSocket extensions**, `permessage-deflate` included. Sonix rejects any
+  frame with an RSV bit set, so this is a refusal rather than a gap; the
+  Autobahn sections covering it are excluded on that basis.
 - **No trailing-slash redirects.** `/items` and `/items/` are distinct routes.
   Implicit redirects are a known source of subtle bugs, including body loss on a
   misconfigured POST redirect.
