@@ -9,7 +9,7 @@ Directory structure enforces this boundary rather than relying only on conventio
 
 This document is the reference for that split, the key design decisions inside each layer, and the order in which the framework is built.
 
-**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. `uv run sonix` serves a demo app end-to-end over a real socket. Middleware, dependency injection, exceptions, and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
+**Implementation status.** Steps 1–6 of the [build order](#build-order) are implemented and tested: the type contract, the HTTP/1.1 parser, the protocol/ASGI bridge, request and response objects, routing, and the `Sonix` app class with `@app.get`-style decorators. A public server API (`Config`, `Server`, `sonix.run`) and a `module:app` CLI have since been added on top — not a numbered build-order step, but a prerequisite for both the example application and the benchmark harness, neither of which can exist while the only way to serve an app is a private function with a hardcoded demo. `uv run sonix` serves that demo end-to-end over a real socket. Middleware, dependency injection, exceptions, and WebSockets are designed below but not yet written — sections covering them describe intent, not existing code. Each section marks its own status.
 
 ## Module layout
 
@@ -17,10 +17,15 @@ Modules marked *(planned)* do not exist yet.
 
 ```
 src/sonix/
-  __init__.py            # public API re-exports + the `sonix` console-script entry point.
+  __init__.py            # public API re-exports, the `module:app` import-string
+                          # resolver, and the `sonix` console-script entry point.
                           # Currently exports Sonix, Request, Response, JSONResponse,
-                          # PlainTextResponse, HTMLResponse; Depends, WebSocket and
-                          # HTTPException join it as their modules land.
+                          # PlainTextResponse, HTMLResponse, Config, Server, run;
+                          # Depends, WebSocket and HTTPException join it as their
+                          # modules land.
+  _demo.py                # the app `sonix` serves when given no target. Inside the
+                          # package rather than under examples/ so a bare `sonix`
+                          # works from an installed wheel with nothing on sys.path.
   types.py                # Scope, Message, Receive, Send, ASGIApp type aliases only — no
                           # logic. Lives at the top level (sibling to server/ and app/)
                           # because it's the shared ASGI contract both layers reference;
@@ -30,6 +35,9 @@ src/sonix/
     __init__.py
     parser.py             # HTTP/1.1 parser — pure, sync, no asyncio import
     protocol.py           # asyncio.Protocol, connection lifecycle, ASGI bridge, keep-alive
+    server.py             # Config/Server: socket binding, serve, graceful shutdown,
+                          # signal handling. The server-lifecycle counterpart to
+                          # protocol.py's connection lifecycle.
     websockets.py         # (planned) WS handshake (Sec-WebSocket-Accept) + frame codec —
                           # bytes-only, protocol-level, no ASGI-app concerns
   app/
@@ -127,6 +135,48 @@ Three details that only surfaced once this ran against a real socket, all of the
 - **The write turnstile.** Pipelined requests run as concurrent tasks, but HTTP/1.1 requires their responses on the wire in request order. On dispatch, each request takes the current turnstile event as the one it must await before writing its response head, and installs a fresh event in its place for whichever request comes next — then sets that fresh event once its own body is complete. The result is a chain of events linking the in-flight requests in arrival order. The error path waits on the same turnstile: a parser failure discovered mid-buffer must not close the transport before the good pipelined responses ahead of it have been written, or they're silently dropped against a closed transport.
 - **Dangling heads are dropped, not dispatched.** A parser error's `partial_events` can end mid-request — a `RequestHeadComplete` with no matching `RequestComplete`, because body framing is exactly what failed. Dispatching that head would spawn a task whose `receive()` can never be satisfied; it would hang forever and, through the turnstile, block every response behind it including the error response. Only events belonging to fully completed requests are replayed.
 - **Cancellation is deferred by one loop iteration.** `connection_lost` puts `http.disconnect` on every live receive queue and then cancels the in-flight tasks — but via `call_soon`, not directly. `put_nowait` only *schedules* the resumption of a task blocked in `queue.get()`; cancelling synchronously races it, and `Task.cancel()` on a task whose awaitable is already done falls back to `_must_cancel`, discarding the disconnect message the app was about to observe.
+
+### `server/server.py` — server lifecycle *(implemented)*
+
+`protocol.py` owns one *connection*; `server.py` owns the *server*: the listening
+socket, the set of live connections, signal handling, and shutdown. It is the public
+entry point into layer 1 — `sonix.run(app)` is a thin wrapper over
+`Server(Config(app)).run()`.
+
+`Config` is a frozen dataclass surfacing every per-connection limit `HTTPProtocol`
+accepts. That parameterization already existed, but nothing forwarded any of it, so
+the defaults were the only reachable values.
+
+`Server` deliberately splits `startup()` / `serve_forever()` / `shutdown()` rather
+than exposing only a blocking `run()`. Tests and the benchmark harness need to bring a
+server up, drive it, and take it down without `serve_forever` owning the event loop;
+`run()` is the convenience layer that adds `SIGINT`/`SIGTERM` handling on top.
+
+**Graceful shutdown, and the ordering trap inside it.** The sequence is: close the
+listening socket, set `should_exit`, close idle connections, drain busy ones against a
+deadline, force-close the remainder, and *only then* `await server.wait_closed()`.
+
+The trap is that last step's position. Since Python 3.12, `asyncio.Server.wait_closed()`
+waits not just for the listener but for every existing connection to finish — so
+awaiting it up front, which reads like the natural "stop accepting, then clean up",
+deadlocks against exactly the connections the drain has not closed yet. The drain
+deadline is bounded for a related reason: a hung handler must not be able to keep the
+process alive indefinitely.
+
+Two details follow from `ServerState` (which lives in `protocol.py`, so that module
+needn't import the one that imports it):
+
+- Connections **register themselves** in `connection_made` and deregister in
+  `connection_lost`, rather than the server tracking them from outside — which would
+  leak entries for connections that died without notice.
+- Once `should_exit` is set, an in-flight response advertises `Connection: close`
+  regardless of what `_decide_close` concluded. Telling a client keep-alive on a socket
+  the server is about to drop invites it to pipeline a request into the void.
+
+**The CLI** takes a uvicorn-style `module:app` import string. That choice matters
+beyond ergonomics: it lets the benchmark harness launch Sonix and uvicorn with
+structurally identical command lines, so the comparison isn't quietly measuring two
+different startup paths.
 
 ### `server/websockets.py` — handshake and frame codec *(planned)*
 
