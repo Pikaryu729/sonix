@@ -72,6 +72,10 @@ DEFAULT_WS_RESUME_WATERMARK = 8
 # check. These match uvicorn's --ws-ping-interval/--ws-ping-timeout defaults.
 DEFAULT_WS_PING_INTERVAL = 20.0
 DEFAULT_WS_PING_TIMEOUT = 20.0
+# How long a deferred close waits for the application task to finish. Bounded
+# for the same reason the server's drain is: the point is to let a well-behaved
+# handler answer one more message, not to let a hung one hold a socket open.
+DEFAULT_WS_CLOSE_TIMEOUT = 5.0
 
 DEFAULT_SERVER_HEADER = b"sonix"
 
@@ -133,6 +137,13 @@ class _WSState(enum.Enum):
 
     CONNECTING = enum.auto()
     CONNECTED = enum.auto()
+    # The close code is decided and the disconnect is already in the
+    # application's queue, but the close frame is not on the wire yet. Inbound
+    # frames are no longer decoded; outbound sends still go through. This
+    # window exists for exactly one thing: letting the application answer
+    # messages that arrived in the same batch as the event that ended the
+    # session.
+    CLOSING = enum.auto()
     CLOSED = enum.auto()
 
 
@@ -358,6 +369,7 @@ class HTTPProtocol(asyncio.Protocol):
         ws_resume_watermark: int = DEFAULT_WS_RESUME_WATERMARK,
         ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL,
         ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT,
+        ws_close_timeout: float | None = DEFAULT_WS_CLOSE_TIMEOUT,
         date_header: bool = True,
         server_header: bytes | None = DEFAULT_SERVER_HEADER,
         upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS,
@@ -379,6 +391,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._ws_resume_watermark = ws_resume_watermark
         self._ws_ping_interval = ws_ping_interval
         self._ws_ping_timeout = ws_ping_timeout
+        self._ws_close_timeout = ws_close_timeout
         self._date_header = date_header
         self._server_header = server_header
         self._upgrade_protocols = upgrade_protocols
@@ -457,6 +470,8 @@ class HTTPProtocol(asyncio.Protocol):
         # no ping is outstanding. Matching on the payload rather than a bare
         # flag means an unsolicited pong cannot clear a real deadline.
         self._ws_pending_ping: bytes | None = None
+        self._ws_pending_close: tuple[int, str, bytes] | None = None
+        self._ws_close_deadline: asyncio.TimerHandle | None = None
 
         self._timeout_handle: asyncio.TimerHandle | None = None
         self._timeout_mode: _TimerMode | None = None
@@ -570,6 +585,7 @@ class HTTPProtocol(asyncio.Protocol):
         self._closed = True
         self._disarm_timeout()
         self._disarm_ws_ping()
+        self._disarm_ws_close_deadline()
         self._disconnected = True
         # Anyone blocked in _drain() is waiting on a resume_writing() that is
         # never coming. Resolve rather than cancel: the caller returns into
@@ -1055,7 +1071,10 @@ class HTTPProtocol(asyncio.Protocol):
 
     def _ws_data_received(self, data: bytes) -> None:
         parser = self._ws_parser
-        if parser is None or self._ws_state is _WSState.CLOSED:
+        if parser is None or self._ws_state in (_WSState.CLOSING, _WSState.CLOSED):
+            # CLOSING: the code is decided and nothing the peer says can
+            # change it, so decoding on would only queue events for an
+            # application that is already unwinding.
             return
         # Any inbound byte proves the peer is alive, so a busy connection
         # never spends anything on keepalive -- and an outstanding ping is
@@ -1099,23 +1118,92 @@ class HTTPProtocol(asyncio.Protocol):
         self._push_to_queue(queue, message, self._ws_pause_watermark)
 
     def _ws_peer_closed(self, event: CloseReceived) -> None:
+        # 1005 is a "no status was present" sentinel and must never go on the
+        # wire, so a payloadless close is echoed payloadless.
+        echo = None if event.code == CloseCode.NO_STATUS else event.code
+        frame = encode_close_frame(echo, event.reason)
+        if self._ws_state is _WSState.CONNECTED:
+            # Deferred for the same reason a violation is, and this path is
+            # the more damaging of the two: a client sending a last message
+            # and then closing in one segment is ordinary traffic, and until
+            # now the application's echo raised RuntimeError into the handler
+            # rather than merely being dropped.
+            self._defer_ws_close(event.code, event.reason, frame)
+            return
         if not self._ws_close_sent:
             self._ws_close_sent = True
-            # 1005 is a "no status was present" sentinel and must never go on
-            # the wire, so a payloadless close is echoed payloadless.
-            code = None if event.code == CloseCode.NO_STATUS else event.code
-            self._ws_write(encode_close_frame(code, event.reason))
+            self._ws_write(frame)
         self._finish_websocket(event.code, event.reason)
 
     def _ws_abort(self, code: int, reason: str) -> None:
+        frame = encode_close_frame(code, reason)
+        if self._ws_state is _WSState.CONNECTED:
+            self._defer_ws_close(code, reason, frame)
+            return
+        # CONNECTING (no application has accepted, so there is nobody to give
+        # a turn to) or already CLOSING/CLOSED: nothing to defer for.
         if not self._ws_close_sent:
             self._ws_close_sent = True
-            self._ws_write(encode_close_frame(code, reason))
+            self._ws_write(frame)
         self._finish_websocket(code, reason)
+
+    def _defer_ws_close(self, code: int, reason: str, frame: bytes) -> None:
+        """Record a close, let the application task finish, write it after.
+
+        The websocket counterpart of _fail(), and it exists for the same
+        reason: a close discovered while decoding a batch must not shut the
+        transport before the good messages ahead of it *in that same batch*
+        have been answered. On the HTTP side the synchronization point is the
+        write turnstile; here there is none -- a websocket task holds a
+        turnstile it never releases -- so the synchronization point is the
+        task itself, and the frame is written by _on_ws_task_done.
+
+        The frame is encoded by the caller so the peer-echo's payloadless-1005
+        rule stays in _ws_peer_closed where it already lives.
+        """
+        self._ws_state = _WSState.CLOSING
+        self._ws_pending_close = (code, reason, frame)
+        self._disarm_ws_ping()
+        # Synchronously, exactly as before: the real code must be recorded
+        # before any connection_lost can enqueue 1006, and it must sit in the
+        # queue *behind* the good message so the application consumes that
+        # message, answers it, and then ends on its own.
+        self._enqueue_ws_disconnect(code, reason)
+        if self._ws_close_timeout is not None:
+            self._ws_close_deadline = self._loop.call_later(
+                self._ws_close_timeout, self._on_ws_close_deadline
+            )
+
+    def _flush_ws_close(self) -> None:
+        """Write the deferred close frame and finish the connection."""
+        pending, self._ws_pending_close = self._ws_pending_close, None
+        if pending is None:
+            return
+        code, reason, frame = pending
+        self._disarm_ws_close_deadline()
+        if not self._ws_close_sent:
+            self._ws_close_sent = True
+            self._ws_write(frame)
+        self._finish_websocket(code, reason)
+
+    def _disarm_ws_close_deadline(self) -> None:
+        if self._ws_close_deadline is not None:
+            self._ws_close_deadline.cancel()
+            self._ws_close_deadline = None
+
+    def _on_ws_close_deadline(self) -> None:
+        """A handler that never returns must not hold the close frame hostage.
+
+        transport.close() inside _flush_ws_close then triggers
+        connection_lost, which cancels the stuck task.
+        """
+        self._ws_close_deadline = None
+        self._flush_ws_close()
 
     def _finish_websocket(self, code: int, reason: str = "") -> None:
         self._ws_state = _WSState.CLOSED
         self._disarm_ws_ping()
+        self._disarm_ws_close_deadline()
         # Enqueued *before* closing the transport, so an application blocked
         # in receive() observes the real code rather than the 1006 that
         # connection_lost would otherwise deliver first.
@@ -1146,6 +1234,11 @@ class HTTPProtocol(asyncio.Protocol):
         """
         if self._ws_state is None or self._ws_state is _WSState.CLOSED:
             return
+        if self._ws_state is _WSState.CLOSING:
+            # Already closing with a code the peer is owed. Shutdown does not
+            # get to relabel it 1001; it only stops waiting for the handler.
+            self._flush_ws_close()
+            return
         if self._ws_state is _WSState.CONNECTED and not self._ws_close_sent:
             self._ws_close_sent = True
             self._ws_write(
@@ -1164,7 +1257,11 @@ class HTTPProtocol(asyncio.Protocol):
                 pass
         if not my_done.is_set():
             my_done.set()
-        if self._ws_state is _WSState.CONNECTED:
+        if self._ws_state is _WSState.CLOSING:
+            # The application has had its turn, and anything it wrote is
+            # already on the wire ahead of this frame.
+            self._flush_ws_close()
+        elif self._ws_state is _WSState.CONNECTED:
             # A handler that simply returns has ended the session. Without
             # this the socket dangles for the life of the process.
             if not self._ws_close_sent:
@@ -1209,6 +1306,21 @@ class HTTPProtocol(asyncio.Protocol):
                     raise RuntimeError("websocket.accept sent more than once")
                 else:
                     raise RuntimeError(f"unexpected ASGI message type: {msg_type!r}")
+            elif state is _WSState.CLOSING:
+                # The whole point of CLOSING: the connection is going away
+                # with a code that is already decided, the application has not
+                # returned yet, and its pending sends are exactly what this
+                # window exists to let through.
+                if msg_type == "websocket.send":
+                    self._ws_send_message(message)
+                    await self._drain()
+                elif msg_type != "websocket.close":
+                    raise RuntimeError(f"unexpected ASGI message type: {msg_type!r}")
+                # A close from the application here is a no-op, not an
+                # override. `finally: await ws.close()` is the standard
+                # handler shape, and honouring it would put 1000 on the wire
+                # where the peer is owed 1002 -- turning the seven Autobahn
+                # non-strict cases into seven outright failures.
             elif msg_type != "websocket.close":
                 raise RuntimeError(f"{msg_type!r} sent after the websocket was closed")
             # A close on an already-closed websocket is a no-op rather than an

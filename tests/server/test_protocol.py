@@ -1359,3 +1359,138 @@ class TestDateAndServerHeaders:
         protocol.data_received(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
         await asyncio.sleep(0.05)
         assert transport.written == b""
+
+
+class TestWebSocketCloseOrdering:
+    """A message batched with the close that follows it must still be answered.
+
+    The Autobahn suite grades seven cases NON-STRICT on exactly this: a valid
+    message and then a protocol violation arrive together, and the echo of the
+    valid one is expected on the wire before the connection fails. It used to
+    be dropped, because the close frame and transport.close() happened in the
+    same event-loop callback that queued the message.
+    """
+
+    async def test_a_message_batched_with_a_violation_is_echoed_first(self):
+        # Autobahn 4.1.3 in miniature: good frame, then an unmasked one.
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(
+            client_frame(Opcode.TEXT, b"good") + encode_frame(Opcode.TEXT, b"unmasked")
+        )
+        await asyncio.sleep(0.05)
+        frames = server_frames(transport)
+        assert frames[0] == TextMessage("good")
+        assert isinstance(frames[1], CloseReceived)
+        assert frames[1].code == 1002
+
+    async def test_a_message_batched_with_an_rsv_violation_is_echoed_first(self):
+        # Autobahn 3.2's shape: good frame, then one with a reserved bit set.
+        bad = bytearray(client_frame(Opcode.TEXT, b"nope"))
+        bad[0] |= 0x40
+        protocol, transport = make_protocol(echo_ws_app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(client_frame(Opcode.TEXT, b"good") + bytes(bad))
+        await asyncio.sleep(0.05)
+        frames = server_frames(transport)
+        assert frames[0] == TextMessage("good")
+        assert frames[1].code == 1002
+
+    async def test_a_message_batched_with_the_peer_close_is_still_echoed(self):
+        # Ordinary traffic, not fuzzing -- and until the deferral this did not
+        # merely drop the echo, it raised RuntimeError into the handler.
+        errors: list[BaseException] = []
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            try:
+                await echo_ws_app(scope, receive, send)
+            except BaseException as exc:
+                errors.append(exc)
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(
+            client_frame(Opcode.TEXT, b"bye")
+            + client_frame(Opcode.CLOSE, struct.pack("!H", 1000))
+        )
+        await asyncio.sleep(0.05)
+        assert errors == []
+        assert server_frames(transport) == [TextMessage("bye"), CloseReceived(1000, "")]
+
+    async def test_an_app_close_does_not_overwrite_the_violation_code(self):
+        # `finally: await ws.close()` is the standard handler shape. Honouring
+        # it here would put 1000 on the wire where the peer is owed 1002.
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            try:
+                while True:
+                    message = await receive()
+                    if message["type"] == "websocket.disconnect":
+                        return
+            finally:
+                await send({"type": "websocket.close", "code": 1000})
+
+        protocol, transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(encode_frame(Opcode.TEXT, b"unmasked"))
+        await asyncio.sleep(0.05)
+        assert [f.code for f in server_frames(transport)] == [1002]
+
+    async def test_a_handler_that_never_returns_does_not_hold_the_close(self):
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await asyncio.Event().wait()
+
+        protocol, transport = make_protocol(app, ws_close_timeout=0.05)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(encode_frame(Opcode.TEXT, b"unmasked"))
+        await asyncio.sleep(0.01)
+        assert not transport.closed
+        await asyncio.sleep(0.15)
+        assert transport.closed
+        assert [f.code for f in server_frames(transport)] == [1002]
+
+    async def test_no_further_frames_are_decoded_while_closing(self):
+        received: list[str] = []
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            while True:
+                message = await receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                received.append(message["text"])
+
+        protocol, _transport = make_protocol(app)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(encode_frame(Opcode.TEXT, b"unmasked"))
+        protocol.data_received(client_frame(Opcode.TEXT, b"too late"))
+        await asyncio.sleep(0.05)
+        assert received == []
+
+    async def test_a_pending_close_survives_shutdown(self):
+        # Shutdown stops waiting for the handler, but does not relabel a code
+        # the peer is already owed.
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await asyncio.Event().wait()
+
+        protocol, transport = make_protocol(app, ws_close_timeout=None)
+        protocol.data_received(HANDSHAKE)
+        await asyncio.sleep(0.01)
+        protocol.data_received(encode_frame(Opcode.TEXT, b"unmasked"))
+        await asyncio.sleep(0.01)
+        assert not transport.closed
+        protocol.shutdown_websocket()
+        assert transport.closed
+        assert [f.code for f in server_frames(transport)] == [1002]

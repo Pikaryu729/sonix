@@ -30,6 +30,7 @@ from sonix.server.protocol import (
     DEFAULT_SERVER_HEADER,
     DEFAULT_WRITE_PAUSE_WATERMARK,
     DEFAULT_WRITE_RESUME_WATERMARK,
+    DEFAULT_WS_CLOSE_TIMEOUT,
     DEFAULT_WS_PAUSE_WATERMARK,
     DEFAULT_WS_PING_INTERVAL,
     DEFAULT_WS_PING_TIMEOUT,
@@ -204,6 +205,10 @@ class Config:
     # set to None disables that half.
     ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL
     ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT
+    # How long a close waits for the application task to finish, so a message
+    # that arrived in the same batch as the close still gets answered. None
+    # closes immediately.
+    ws_close_timeout: float | None = DEFAULT_WS_CLOSE_TIMEOUT
 
     # RFC 9110 section 6.6.1: an origin server with a clock sends Date.
     # Beyond conformance this is a fairness matter -- uvicorn sends both, and a
@@ -250,6 +255,7 @@ class Config:
             ws_resume_watermark=self.ws_resume_watermark,
             ws_ping_interval=self.ws_ping_interval,
             ws_ping_timeout=self.ws_ping_timeout,
+            ws_close_timeout=self.ws_close_timeout,
             date_header=self.date_header,
             server_header=self.server_header,
             upgrade_protocols=self.upgrade_protocols,

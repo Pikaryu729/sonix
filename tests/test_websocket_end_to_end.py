@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import struct
 
 import pytest
@@ -23,7 +24,7 @@ from sonix import Sonix
 from sonix.app.exceptions import WebSocketException
 from sonix.app.websockets import WebSocket, WebSocketDisconnect
 from sonix.server.server import Config, Server
-from sonix.server.websockets import Opcode, encode_frame
+from sonix.server.websockets import Opcode, encode_close_frame, encode_frame
 
 TIMEOUT = 5
 
@@ -358,6 +359,39 @@ class TestClosing:
             await WSTestClient.connect(host, port) as client,
         ):
             assert await asyncio.wait_for(client.receive_text(), TIMEOUT) == "one"
+            close = await asyncio.wait_for(client.receive_close(), TIMEOUT)
+            assert close.code == 1000
+
+    async def test_a_message_sent_with_a_violation_is_echoed_before_the_close(self):
+        # The real-socket proof for the seven Autobahn NON-STRICT cases, and
+        # the closest local proxy for them since the suite needs Docker. Both
+        # frames go out in a single write, so they reach the server in one
+        # data_received: a valid masked TEXT, then an unmasked one the codec
+        # must reject with 1002.
+        async with (
+            serving(echo_app()) as (host, port),
+            await WSTestClient.connect(host, port) as client,
+        ):
+            await client.send_raw(
+                encode_frame(Opcode.TEXT, b"last", mask=os.urandom(4))
+                + encode_frame(Opcode.TEXT, b"bad")
+            )
+            assert await asyncio.wait_for(client.receive_text(), TIMEOUT) == "last"
+            close = await asyncio.wait_for(client.receive_close(), TIMEOUT)
+            assert close.code == 1002
+
+    async def test_a_message_sent_with_a_close_is_echoed_before_the_echo_close(self):
+        # The ordinary-traffic version: a client saying one last thing and
+        # then closing, in one write.
+        async with (
+            serving(echo_app()) as (host, port),
+            await WSTestClient.connect(host, port) as client,
+        ):
+            await client.send_raw(
+                encode_frame(Opcode.TEXT, b"bye", mask=os.urandom(4))
+                + encode_close_frame(1000, "done", mask=os.urandom(4))
+            )
+            assert await asyncio.wait_for(client.receive_text(), TIMEOUT) == "bye"
             close = await asyncio.wait_for(client.receive_close(), TIMEOUT)
             assert close.code == 1000
 
