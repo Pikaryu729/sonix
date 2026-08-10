@@ -1,34 +1,16 @@
 import pytest
+from helpers import make_receive
+from helpers import make_scope as _make_scope
 
 from sonix.app.requests import ClientDisconnect, Request
 
 
 def make_scope(**overrides):
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "method": "GET",
-        "scheme": "http",
-        "path": "/items/42",
-        "raw_path": b"/items/42",
-        "query_string": b"",
-        "root_path": "",
-        "headers": [(b"host", b"example.com")],
-        "client": ("127.0.0.1", 54321),
-        "server": ("127.0.0.1", 8000),
-    }
-    scope.update(overrides)
-    return scope
-
-
-def make_receive(messages):
-    it = iter(messages)
-
-    async def receive():
-        return next(it)
-
-    return receive
+    # These tests were written against a non-root default path; keep it so the
+    # url/path assertions below stay meaningful.
+    overrides.setdefault("path", "/items/42")
+    overrides.setdefault("raw_path", b"/items/42")
+    return _make_scope(**overrides)
 
 
 class TestHeaders:

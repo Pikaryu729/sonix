@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A new push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job syncs with `--locked`, which fails rather than silently resolving a
+# different version than uv.lock pins. Deliberately NOT paired with UV_FROZEN:
+# uv rejects the two together outright ("the argument `--locked` cannot be used
+# with `UV_FROZEN`"), and this workflow set both, so every step failed in under
+# a second and CI had never actually run. `--locked` is the stronger of the two
+# anyway -- it verifies the lockfile is up to date, where --frozen only skips
+# the check.
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: ruff check
+        run: uv run ruff check .
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # The conformance group is needed here even though those tests do not
+      # run in this job: ty resolves imports, and tests/conformance/ imports
+      # fastapi and starlette. Without it the job fails on unresolved-import
+      # for files the test job correctly skips.
+      - run: uv sync --locked --group conformance
+      - run: uv run ty check
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: pytest
+        run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=90
+
+  conformance:
+    name: Cross-implementation conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked --group conformance
+      # Proves both directions of the two-layer split: FastAPI and Starlette
+      # served by Sonix's HTTP server, and a Sonix app served by uvicorn.
+      # Runs separately from the main test job precisely because that job
+      # must keep passing with zero third-party packages installed.
+      - name: FastAPI / Starlette on Sonix, and Sonix under uvicorn
+        run: uv run --group conformance pytest tests/conformance -v
+
+  websocket-conformance:
+    name: Autobahn WebSocket testsuite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Start the echo server
+        run: |
+          uv run python tests/autobahn/echo_server.py 9001 &
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then exit 0; fi
+            sleep 0.2
+          done
+          echo "echo server never started listening" >&2
+          exit 1
+      # ~500 RFC 6455 cases driven from outside: framing, fragmentation,
+      # UTF-8, close codes, and deliberate protocol abuse. Sections 12 and 13
+      # (permessage-deflate) are excluded in the spec file -- Sonix
+      # negotiates no extensions, which is a documented non-goal rather than
+      # a partial implementation.
+      - name: Run the fuzzing client
+        working-directory: tests/autobahn
+        run: |
+          docker run --rm \
+            -v "$PWD/fuzzingclient.json:/config/fuzzingclient.json" \
+            -v "$PWD/reports:/reports" \
+            --network host \
+            crossbario/autobahn-testsuite \
+            wstest --mode fuzzingclient --spec /config/fuzzingclient.json
+      # wstest always exits 0 -- it reports rather than judges -- so without
+      # this the job would be green whatever the results said.
+      - name: Check the report
+        working-directory: tests/autobahn
+        run: uv run python check_report.py reports/servers/index.json
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: tests/autobahn/reports/
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      # -W turns warnings into errors, so a page missing from the toctree or a
+      # broken reference fails the build instead of shipping silently.
+      - run: uv run sphinx-build -W -b html docs docs/_build/html

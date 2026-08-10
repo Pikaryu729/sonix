@@ -1,29 +1,49 @@
-"""Sonix: the app class and @app.get/@app.post/... decorators.
+"""Sonix: the app class and @app.get/@app.post/@app.websocket decorators.
 
-First pass, no DI or middleware yet (those are later milestones) -- a
-registered handler always takes exactly one argument, a Request, mirroring
-the calling convention frameworks like Starlette started with before
-adding signature-based dependency injection on top. A sync handler runs
-via asyncio.to_thread so it never blocks the event loop; this part of the
-"await handler(...) directly if async, else asyncio.to_thread" behavior
-is independent of DI and safe to build now.
+A handler declares whatever parameters it needs and app/di.py builds the plan
+to satisfy them, once, at decoration time. The pre-DI convention -- a single
+Request argument -- still works, as the degenerate case of that. A sync HTTP
+handler runs via asyncio.to_thread so it never blocks the event loop; a sync
+*websocket* handler is refused outright, since every WebSocket method is a
+coroutine and a worker thread could not await one.
+
+Middleware composition lives in app/middleware.py; this module owns the
+registration lists and decides when the stack gets built -- once, on the
+first request, because it cannot be assembled until every route and
+middleware is registered.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import Callable
 from typing import Any
 
+from sonix.app.di import build_plan, resolve
+from sonix.app.lifespan import (
+    LifespanFactory,
+    LifespanHandler,
+    events_lifespan,
+)
+from sonix.app.middleware import (
+    ExceptionHandler,
+    HandlerKey,
+    Middleware,
+    build_stack,
+)
 from sonix.app.requests import Request
 from sonix.app.responses import JSONResponse, PlainTextResponse, Response
-from sonix.app.routing import Router
+from sonix.app.routing import Router, compile_path
+from sonix.app.websockets import WebSocket
 from sonix.types import ASGIApp, Receive, Scope, Send
 
-# Any is broad enough to cover a sync return value or an Awaitable one --
-# a separate Awaitable[Any] arm would be redundant.
-Handler = Callable[[Request], Any]
+# Callable[..., Any] rather than Callable[[Request], Any]: since DI landed a
+# handler declares whatever parameters it needs, and the plan decides how to
+# fill them. Any on the return covers a sync value or an awaitable one -- a
+# separate Awaitable[Any] arm would be redundant.
+Handler = Callable[..., Any]
 
 
 def _is_coroutine_callable(handler: Handler) -> bool:
@@ -53,24 +73,159 @@ def _coerce_response(result: Any) -> Response:
     return JSONResponse(result)
 
 
-def _endpoint(handler: Handler) -> ASGIApp:
+def _endpoint(handler: Handler, path: str) -> ASGIApp:
     is_coroutine = _is_coroutine_callable(handler)
+    # Inspected exactly once, here, at decoration time. compile_path is called
+    # a second time (Router.add_route does it too) purely to learn which names
+    # the template binds; that is registration-time work, not per-request.
+    _pattern, path_converters = compile_path(path)
+    plan = build_plan(handler, path_converters=path_converters)
+
+    async def run(
+        request: Request,
+        stack: contextlib.AsyncExitStack | None,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        kwargs = await resolve(plan, request, stack)
+        if is_coroutine:
+            result = await handler(**kwargs)
+        else:
+            result = await asyncio.to_thread(handler, **kwargs)
+        response = _coerce_response(result)
+        await response(scope, receive, send)
 
     async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
-        if is_coroutine:
-            result = await handler(request)
-        else:
-            result = await asyncio.to_thread(handler, request)
-        response = _coerce_response(result)
-        await response(scope, receive, send)
+        if not plan.needs_teardown:
+            # No `yield` dependency in the graph, so an AsyncExitStack would
+            # have nothing to close. Constructing one per request is not free,
+            # and every handler written before DI existed takes this path.
+            await run(request, None, scope, receive, send)
+            return
+        # The stack wraps sending the response too, so a `yield` dependency's
+        # teardown runs *after* the body is on the wire -- closing a database
+        # connection before the rows it produced have been serialized would be
+        # a subtle and infuriating bug.
+        async with contextlib.AsyncExitStack() as stack:
+            await run(request, stack, scope, receive, send)
+
+    return endpoint
+
+
+def _ws_endpoint(handler: Handler, path: str) -> ASGIApp:
+    if not _is_coroutine_callable(handler):
+        # Not a stylistic preference. A sync handler runs in
+        # asyncio.to_thread, and every method on WebSocket is a coroutine --
+        # so such a handler could do nothing whatsoever with its only
+        # argument. A sync HTTP handler at least computes and returns a value.
+        name = getattr(handler, "__name__", repr(handler))
+        raise TypeError(
+            f"websocket handler {name!r} must be async: every WebSocket "
+            f"method is a coroutine, so a sync handler run in a worker "
+            f"thread could not await a single one of them"
+        )
+    _pattern, path_converters = compile_path(path)
+    plan = build_plan(handler, path_converters=path_converters, scope_type="websocket")
+
+    async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
+        websocket = WebSocket(scope, receive, send)
+        # No _coerce_response tail: a websocket handler's return value is
+        # meaningless -- returning is simply how a session ends.
+        if not plan.needs_teardown:
+            await handler(**await resolve(plan, websocket, None))
+            return
+        async with contextlib.AsyncExitStack() as stack:
+            await handler(**await resolve(plan, websocket, stack))
 
     return endpoint
 
 
 class Sonix:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        middleware: list[Middleware] | None = None,
+        exception_handlers: dict[HandlerKey, ExceptionHandler] | None = None,
+        lifespan: LifespanFactory | None = None,
+    ) -> None:
         self.router = Router()
+        self.debug = debug
+        self._lifespan_factory = lifespan
+        self._on_startup: list[Callable[[], Any]] = []
+        self._on_shutdown: list[Callable[[], Any]] = []
+        self._middleware: list[Middleware] = list(middleware or [])
+        self._exception_handlers: dict[HandlerKey, ExceptionHandler] = dict(
+            exception_handlers or {}
+        )
+        self._stack: ASGIApp | None = None
+
+    # -- lifespan -------------------------------------------------------------
+
+    def on_startup(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """Sugar for a startup hook with no resource to hand onward."""
+        self._assert_not_started("on_startup")
+        self._on_startup.append(fn)
+        return fn
+
+    def on_shutdown(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        self._assert_not_started("on_shutdown")
+        self._on_shutdown.append(fn)
+        return fn
+
+    def _build_lifespan(self) -> LifespanHandler:
+        if self._lifespan_factory is not None:
+            if self._on_startup or self._on_shutdown:
+                raise RuntimeError(
+                    "pass either lifespan= or on_startup/on_shutdown, not both: "
+                    "combining them makes the ordering between the two "
+                    "ambiguous"
+                )
+            return LifespanHandler(self, self._lifespan_factory)
+        if self._on_startup or self._on_shutdown:
+            return LifespanHandler(
+                self, events_lifespan(self._on_startup, self._on_shutdown)
+            )
+        return LifespanHandler(self)
+
+    # -- middleware and exception handlers -----------------------------------
+
+    def add_middleware(self, cls: Callable[..., ASGIApp], **options: Any) -> None:
+        """Register a middleware class. First registered ends up outermost."""
+        self._assert_not_started("add_middleware")
+        self._middleware.append(Middleware(cls, options))
+
+    def add_exception_handler(self, key: HandlerKey, handler: ExceptionHandler) -> None:
+        self._assert_not_started("add_exception_handler")
+        self._exception_handlers[key] = handler
+
+    def exception_handler(
+        self, key: HandlerKey
+    ) -> Callable[[ExceptionHandler], ExceptionHandler]:
+        def decorator(handler: ExceptionHandler) -> ExceptionHandler:
+            self.add_exception_handler(key, handler)
+            return handler
+
+        return decorator
+
+    def _assert_not_started(self, what: str) -> None:
+        # The stack is built once, on the first request. Mutating the
+        # registration lists afterwards would silently have no effect, which
+        # is worse than refusing.
+        if self._stack is not None:
+            raise RuntimeError(
+                f"{what}() cannot be called after the app has started serving"
+            )
+
+    def build_middleware_stack(self) -> ASGIApp:
+        return build_stack(
+            self.router,
+            self._middleware,
+            handlers=self._exception_handlers,
+            debug=self.debug,
+        )
 
     def route(
         self, path: str, methods: list[str] | None = None
@@ -84,7 +239,19 @@ class Sonix:
     def add_route(
         self, path: str, handler: Handler, methods: list[str] | None = None
     ) -> None:
-        self.router.add_route(path, _endpoint(handler), methods=methods)
+        self.router.add_route(path, _endpoint(handler, path), methods=methods)
+
+    def websocket(self, path: str) -> Callable[[Handler], Handler]:
+        """Register a websocket handler. Shares the path space with HTTP."""
+
+        def decorator(handler: Handler) -> Handler:
+            self.add_websocket_route(path, handler)
+            return handler
+
+        return decorator
+
+    def add_websocket_route(self, path: str, handler: Handler) -> None:
+        self.router.add_websocket_route(path, _ws_endpoint(handler, path))
 
     def get(self, path: str) -> Callable[[Handler], Handler]:
         return self.route(path, methods=["GET"])
@@ -102,4 +269,17 @@ class Sonix:
         return self.route(path, methods=["DELETE"])
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await self.router(scope, receive, send)
+        scope_type = scope["type"]
+        if scope_type == "lifespan":
+            # This method used to delegate to the router unconditionally, so a
+            # lifespan scope reached Router.__call__ and died on scope["path"]
+            # with a bare KeyError -- meaning a Sonix app could not run under
+            # uvicorn at all, quietly falsifying the two-layer claim.
+            await self._build_lifespan()(scope, receive, send)
+            return
+        if scope_type not in ("http", "websocket"):
+            raise RuntimeError(f"unsupported ASGI scope type {scope_type!r}")
+
+        if self._stack is None:
+            self._stack = self.build_middleware_stack()
+        await self._stack(scope, receive, send)

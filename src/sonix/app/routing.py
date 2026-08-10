@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sonix.app.responses import PlainTextResponse
+from sonix.app.exceptions import HTTPException, WebSocketException
 from sonix.types import ASGIApp, Receive, Scope, Send
 
 
@@ -107,7 +107,16 @@ class Route:
     converters: dict[str, Converter]
     methods: tuple[str, ...]
     handler: ASGIApp
-    di_plan: Any | None = None
+    # "http" or "websocket". A field rather than overloading methods=None
+    # (which add_route already reads as "default to GET") or keeping a second
+    # route list (which would split the registration-order, first-match-wins
+    # invariant across two orderings). Websocket routes carry methods=().
+    scope_type: str = "http"
+    # No di_plan field. docs/architecture.md originally put the DI plan here,
+    # but by the time a Route exists the handler has already been wrapped into
+    # an ASGIApp that closes over its own plan -- which is where the signature
+    # was known in the first place. A field routing never reads is worse than
+    # no field.
 
 
 class Router:
@@ -136,14 +145,35 @@ class Router:
         route_methods = tuple(
             m.upper() for m in (methods if methods is not None else ["GET"])
         )
-        self._routes.append(Route(pattern, converters, route_methods, handler, None))
+        self._routes.append(Route(pattern, converters, route_methods, handler))
+
+    def add_websocket_route(self, path: str, handler: ASGIApp) -> None:
+        """Register a websocket route. Shares the path space with HTTP routes.
+
+        The same path may carry both an HTTP and a websocket route without
+        colliding, since matching considers scope type as well as path.
+        """
+        pattern, converters = compile_path(path)
+        self._routes.append(Route(pattern, converters, (), handler, "websocket"))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Before scope["method"], which a websocket scope does not have.
+        if scope["type"] == "websocket":
+            await self._dispatch_websocket(scope, receive, send)
+            return
+
         path = scope["path"]
         method = scope["method"]
 
         allowed: dict[str, None] = {}  # insertion-ordered set
         for route in self._routes:
+            # Explicit rather than emergent. Iterating a websocket route's
+            # empty methods tuple would also add nothing to `allowed`, so an
+            # HTTP request to a websocket-only path would 404 either way --
+            # but relying on that is one refactor away from a 405 carrying an
+            # empty Allow header.
+            if route.scope_type != "http":
+                continue
             match = route.pattern.fullmatch(path)
             if match is None:
                 continue
@@ -163,12 +193,36 @@ class Router:
             await route.handler(scope, receive, send)
             return
 
+        # Raised rather than returned, so that a custom 404 or 405 is a matter
+        # of registering an exception handler. Constructing the response here
+        # made these two statuses the only ones in the framework with no
+        # override hook. It does mean Router is not a complete ASGI app on its
+        # own -- it expects the ExceptionMiddleware that Sonix always wraps it
+        # in.
         if allowed:
-            response = PlainTextResponse(
-                "Method Not Allowed",
-                status_code=405,
-                headers={"allow": ", ".join(allowed)},
-            )
-        else:
-            response = PlainTextResponse("Not Found", status_code=404)
-        await response(scope, receive, send)
+            raise HTTPException(405, headers={"allow": ", ".join(allowed)})
+        raise HTTPException(404)
+
+    async def _dispatch_websocket(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        path = scope["path"]
+        for route in self._routes:
+            if route.scope_type != "websocket":
+                continue
+            match = route.pattern.fullmatch(path)
+            if match is None:
+                continue
+            scope["path_params"] = {
+                name: route.converters[name].convert(value)
+                for name, value in match.groupdict().items()
+            }
+            await route.handler(scope, receive, send)
+            return
+
+        # Not HTTPException(404): a websocket has no status line to put a 404
+        # on. The only refusal a websocket scope understands is a close, so
+        # "no such websocket path" is deliberately not observable as a 404 --
+        # before accept it reaches the client as the HTTP 403 the ASGI spec
+        # mandates for a denied handshake.
+        raise WebSocketException(1000, f"no websocket route for {path!r}")

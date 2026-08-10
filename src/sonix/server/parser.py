@@ -5,6 +5,12 @@ Pure and synchronous: no ``asyncio`` import, no I/O. Bytes go in via
 inspects headers to decide framing more than once per rule -- the same
 request must not be parsed two different ways by two different pieces
 of code, which is the classic root cause of request smuggling.
+
+That rule is why "this connection has stopped speaking HTTP" is decided
+here rather than a layer up. Deciding it above would be too late anyway:
+``feed_data`` runs to exhaustion before it returns, so by the time a
+caller could inspect the head's headers, the bytes after an upgrade
+handshake have already been parsed as though they were another request.
 """
 
 from __future__ import annotations
@@ -46,6 +52,13 @@ class RequestHead:
     query_string: bytes
     http_version: str
     headers: list[tuple[bytes, bytes]] = field(default_factory=list)
+    # The lowercased Upgrade token when this request switches the connection to
+    # another protocol ("websocket"), otherwise None. A token rather than a
+    # bool: HTTP/1.1 Upgrade is a general mechanism, and a string lets the
+    # caller say "I only implement websocket" by comparing a value the parser
+    # handed it -- rather than re-tokenizing the header itself, which is
+    # exactly the duplicated-framing-decision this module exists to prevent.
+    upgrade: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +84,9 @@ class _State(enum.Enum):
     START_LINE = enum.auto()
     HEADERS = enum.auto()
     BODY = enum.auto()
+    # Terminal. HTTP framing has stopped for the life of this connection
+    # because the request head switched it to another protocol.
+    UPGRADED = enum.auto()
 
 
 class _ChunkState(enum.Enum):
@@ -79,6 +95,8 @@ class _ChunkState(enum.Enum):
     DATA_CRLF = enum.auto()
     TRAILERS = enum.auto()
 
+
+DEFAULT_UPGRADE_PROTOCOLS = frozenset({"websocket"})
 
 _TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HEX_RE = re.compile(rb"^[0-9A-Fa-f]+$")
@@ -101,15 +119,34 @@ class HTTP11Parser:
         max_header_size: int = 8 * 1024,
         max_headers: int = 100,
         max_body_size: int = 16 * 1024 * 1024,
+        upgrade_protocols: frozenset[str] = DEFAULT_UPGRADE_PROTOCOLS,
     ) -> None:
         self.max_header_size = max_header_size
         self.max_headers = max_headers
         self.max_body_size = max_body_size
+        # Which Upgrade tokens actually stop HTTP framing on this connection.
+        # This is what keeps the parser ignorant of WebSocket *semantics* while
+        # still owning the framing *consequence*: an offer this server does not
+        # implement (say `Upgrade: h2c` with h2c absent here) leaves
+        # head.upgrade as None and the request is parsed as an ordinary
+        # HTTP/1.1 request, which is what RFC 9110 section 7.8 prescribes.
+        self.upgrade_protocols = upgrade_protocols
         self._buffer = bytearray()
         self._state = _State.START_LINE
         self._reset_for_next_request()
 
+    @property
+    def upgraded(self) -> bool:
+        """True once a request head switched the connection off HTTP."""
+        return self._state is _State.UPGRADED
+
     def feed_data(self, data: bytes) -> list[Event]:
+        if self._state is _State.UPGRADED:
+            # Post-upgrade bytes belong to whatever protocol took over. Buffer
+            # them rather than raising, so a caller that has not yet drained
+            # take_buffer() loses nothing.
+            self._buffer.extend(data)
+            return []
         self._buffer.extend(data)
         events: list[Event] = []
         while True:
@@ -120,8 +157,11 @@ class HTTP11Parser:
                     progressed = self._consume_headers(events)
                 elif self._state is _State.BODY:
                     progressed = self._consume_body(events)
-                else:  # pragma: no cover - exhaustive over _State
-                    raise AssertionError(f"unreachable parser state: {self._state}")
+                else:
+                    # UPGRADED. Terminal, so nothing can progress -- and this
+                    # is the whole point: no second RequestHeadComplete can be
+                    # emitted for bytes the client believes are tunnelled.
+                    progressed = False
             except HTTPParserError as exc:
                 exc.partial_events = events
                 raise
@@ -130,8 +170,28 @@ class HTTP11Parser:
         return events
 
     def feed_eof(self) -> None:
+        if self._state is _State.UPGRADED:
+            # An upgraded connection closing is not an incomplete request --
+            # there is no request in flight, and never will be again.
+            return
         if self._state is not _State.START_LINE or self._buffer:
             raise MalformedRequest("connection closed with an incomplete request")
+
+    def take_buffer(self) -> bytes:
+        """Hand over the bytes that follow an upgrade head, and clear them.
+
+        Clients may send the first frame of the new protocol in the same TCP
+        segment as the handshake, in which case those bytes are already sitting
+        in this parser's buffer. Without this they would be silently lost.
+
+        Only legal once upgraded: in any other state the buffer holds a
+        partially-parsed request that this parser still owns.
+        """
+        if self._state is not _State.UPGRADED:
+            raise RuntimeError("take_buffer() is only valid after an upgrade")
+        data = bytes(self._buffer)
+        del self._buffer[:]
+        return data
 
     # -- internal state ---------------------------------------------------
 
@@ -148,6 +208,9 @@ class HTTP11Parser:
         self._content_length: int | None = None
         self._transfer_encoding_seen = False
         self._chunked = False
+        self._connection_tokens: set[bytes] = set()
+        self._upgrade_token: bytes | None = None
+        self._upgrade_token_valid = False
         self._body_remaining = 0
         self._chunk_state = _ChunkState.SIZE
         self._chunk_remaining = 0
@@ -223,6 +286,13 @@ class HTTP11Parser:
         assert self._path is not None
         assert self._query_string is not None
         assert self._http_version is not None
+        upgrade = self._detect_upgrade()
+        if upgrade is not None and (self._chunked or (self._content_length or 0) > 0):
+            raise MalformedRequest(
+                "an upgrade request must not declare a body: the bytes after "
+                "the head would be ambiguously body or post-upgrade protocol "
+                "data"
+            )
         head = RequestHead(
             method=self._method,
             target=self._target,
@@ -230,10 +300,42 @@ class HTTP11Parser:
             query_string=self._query_string,
             http_version=self._http_version,
             headers=list(self._headers),
+            upgrade=upgrade,
         )
         events.append(RequestHeadComplete(head))
+        if upgrade is not None:
+            # Deliberately no BodyChunk, no RequestComplete, and no reset. HTTP
+            # framing is over: whatever follows in the buffer belongs to the
+            # new protocol and is handed out by take_buffer().
+            #
+            # This is also a request-smuggling defense, not just bookkeeping.
+            # Without it, a client sending
+            #     GET /ws HTTP/1.1 ... Upgrade: websocket\r\n\r\n
+            #     GET /admin HTTP/1.1\r\nHost: x\r\n\r\n
+            # in one segment would produce *two* RequestHeadComplete events and
+            # the second would be dispatched as a real request -- on a
+            # connection the client believes is an opaque tunnel.
+            self._state = _State.UPGRADED
+            return
         self._body_remaining = self._content_length or 0
         self._state = _State.BODY
+
+    def _detect_upgrade(self) -> str | None:
+        if b"upgrade" not in self._connection_tokens:
+            return None
+        if self._upgrade_token is None or not self._upgrade_token_valid:
+            return None
+        # RFC 6455 section 4.1: the handshake is a bodyless HTTP/1.1 GET. A
+        # server that switched protocols on anything else would be guessing.
+        if self._method != "GET" or self._http_version != "1.1":
+            return None
+        try:
+            token = self._upgrade_token.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if token not in self.upgrade_protocols:
+            return None
+        return token
 
     def _consume_header_line(self, line: bytes) -> None:
         if line[:1] in (b" ", b"\t"):
@@ -258,6 +360,24 @@ class HTTP11Parser:
             self._handle_content_length(value)
         elif name_lower == b"transfer-encoding":
             self._handle_transfer_encoding(value)
+        elif name_lower == b"connection":
+            self._connection_tokens.update(
+                token.strip().lower() for token in value.split(b",")
+            )
+        elif name_lower == b"upgrade":
+            self._handle_upgrade(value)
+
+    def _handle_upgrade(self, value: bytes) -> None:
+        # Only a single-token Upgrade offer is honoured. A list ("websocket,
+        # h2c") would make "which protocol did we switch to" a negotiation,
+        # and a parser that guesses wrong hands the connection to the wrong
+        # reader -- so the whole header is ignored instead.
+        token = value.strip().lower()
+        if self._upgrade_token is not None:
+            self._upgrade_token_valid = False
+            return
+        self._upgrade_token = token
+        self._upgrade_token_valid = bool(token) and b"," not in token
 
     def _handle_content_length(self, value: bytes) -> None:
         if self._content_length is not None:

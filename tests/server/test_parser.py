@@ -266,7 +266,8 @@ class TestTransferEncodingSmuggling:
         with pytest.raises(MalformedRequest):
             feed(
                 p,
-                b"POST / HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: identity\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: e.com\r\n"
+                b"Transfer-Encoding: identity\r\n\r\n",
             )
 
 
@@ -490,3 +491,217 @@ class TestConnectionLifecycle:
         # silently accepted as a body.
         with pytest.raises(MalformedRequest):
             feed(p, b"not a valid request line\r\n\r\n")
+
+
+HANDSHAKE = (
+    b"GET /ws HTTP/1.1\r\n"
+    b"Host: e.com\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n"
+    b"\r\n"
+)
+
+
+class TestProtocolUpgrade:
+    def test_upgrade_head_emits_only_the_head(self):
+        p = parser()
+        events = feed(p, HANDSHAKE)
+        # No BodyChunk and no RequestComplete: HTTP framing has stopped, so
+        # there is no "rest of this request" to describe.
+        assert len(events) == 1
+        assert isinstance(events[0], RequestHeadComplete)
+        assert events[0].head.upgrade == "websocket"
+        assert events[0].head.path == "/ws"
+        assert p.upgraded is True
+
+    def test_ordinary_request_has_no_upgrade(self):
+        p = parser()
+        events = feed(p, b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        assert events[0].head.upgrade is None
+        assert p.upgraded is False
+
+    def test_take_buffer_returns_the_prologue(self):
+        p = parser()
+        # A client that sends its first frame in the same segment as the
+        # handshake. Those bytes are inside the parser; without take_buffer()
+        # they would be silently lost.
+        events = feed(p, HANDSHAKE + b"\x81\x85frame")
+        assert len(events) == 1
+        assert p.take_buffer() == b"\x81\x85frame"
+        assert p.take_buffer() == b""
+
+    def test_take_buffer_before_upgrade_is_an_error(self):
+        p = parser()
+        feed(p, b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        with pytest.raises(RuntimeError, match="only valid after an upgrade"):
+            p.take_buffer()
+
+    def test_bytes_fed_after_upgrade_are_buffered_not_parsed(self):
+        p = parser()
+        feed(p, HANDSHAKE)
+        assert feed(p, b"\x89\x80mask") == []
+        assert p.take_buffer() == b"\x89\x80mask"
+
+    def test_feed_eof_after_upgrade_does_not_raise(self):
+        p = parser()
+        feed(p, HANDSHAKE)
+        p.feed_eof()
+
+    def test_pipelined_request_behind_an_upgrade_is_never_dispatched(self):
+        # The smuggling case this state exists for. Without UPGRADED the
+        # parser emits a second RequestHeadComplete for /admin, which the
+        # bridge would dispatch as a genuine request -- on a connection the
+        # client believes is an opaque tunnel.
+        p = parser()
+        smuggled = b"GET /admin HTTP/1.1\r\nHost: e.com\r\n\r\n"
+        events = feed(p, HANDSHAKE + smuggled)
+        heads = [e for e in events if isinstance(e, RequestHeadComplete)]
+        assert len(heads) == 1
+        assert heads[0].head.path == "/ws"
+        # The smuggled request is inert: bytes, not an event.
+        assert p.take_buffer() == smuggled
+
+    def test_unoffered_protocol_parses_as_an_ordinary_request(self):
+        # RFC 9110 section 7.8: a server that does not implement the offered
+        # protocol ignores the Upgrade header and answers the request
+        # normally. Only a protocol we actually switch to stops framing.
+        p = parser()
+        events = feed(
+            p,
+            b"GET / HTTP/1.1\r\nHost: e.com\r\n"
+            b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+        assert isinstance(events[-1], RequestComplete)
+        assert p.upgraded is False
+
+    def test_upgrade_protocols_is_configurable(self):
+        p = parser(upgrade_protocols=frozenset({"h2c"}))
+        events = feed(
+            p,
+            b"GET / HTTP/1.1\r\nHost: e.com\r\n"
+            b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade == "h2c"
+
+    def test_upgrade_protocols_empty_disables_upgrades(self):
+        p = parser(upgrade_protocols=frozenset())
+        events = feed(p, HANDSHAKE)
+        assert events[0].head.upgrade is None
+        assert isinstance(events[-1], RequestComplete)
+
+    @pytest.mark.parametrize(
+        "connection_value",
+        [b"Upgrade", b"upgrade", b"keep-alive, Upgrade", b"Upgrade, keep-alive"],
+    )
+    def test_connection_header_is_tokenized(self, connection_value):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+            b"Connection: " + connection_value + b"\r\n\r\n",
+        )
+        assert events[0].head.upgrade == "websocket"
+
+    def test_upgrade_without_connection_token_is_ignored(self):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    def test_connection_upgrade_without_upgrade_header_is_ignored(self):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nConnection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    def test_multiple_upgrade_headers_are_ignored(self):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+            b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    def test_upgrade_offer_list_is_ignored(self):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket, h2c\r\n"
+            b"Connection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    @pytest.mark.parametrize("method", [b"POST", b"PUT", b"HEAD"])
+    def test_upgrade_only_honoured_on_get(self, method):
+        p = parser()
+        events = feed(
+            p,
+            method + b" /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    def test_upgrade_not_honoured_on_http_1_0(self):
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.0\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n",
+        )
+        assert events[0].head.upgrade is None
+
+    def test_upgrade_with_a_body_is_rejected(self):
+        # Two readers would disagree about where the request ends: one sees
+        # five body bytes, the other sees five bytes of the new protocol.
+        p = parser()
+        with pytest.raises(MalformedRequest, match="must not declare a body"):
+            feed(
+                p,
+                b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nContent-Length: 5\r\n\r\nhello",
+            )
+
+    def test_upgrade_with_chunked_body_is_rejected(self):
+        p = parser()
+        with pytest.raises(MalformedRequest, match="must not declare a body"):
+            feed(
+                p,
+                b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+
+    def test_upgrade_with_zero_content_length_is_allowed(self):
+        # Unambiguous, and some clients send it.
+        p = parser()
+        events = feed(
+            p,
+            b"GET /ws HTTP/1.1\r\nHost: e.com\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nContent-Length: 0\r\n\r\n",
+        )
+        assert events[0].head.upgrade == "websocket"
+        assert len(events) == 1
+
+    def test_upgrade_split_across_feeds(self):
+        p = parser()
+        collected = []
+        for index in range(len(HANDSHAKE)):
+            collected.extend(feed(p, HANDSHAKE[index : index + 1]))
+        assert len(collected) == 1
+        assert collected[0].head.upgrade == "websocket"
+
+    def test_request_before_an_upgrade_still_dispatches(self):
+        # Pipelining a normal request ahead of the handshake is legal, and the
+        # first request must still be answered.
+        p = parser()
+        events = feed(p, b"GET /a HTTP/1.1\r\nHost: e.com\r\n\r\n" + HANDSHAKE)
+        heads = [e for e in events if isinstance(e, RequestHeadComplete)]
+        assert [h.head.path for h in heads] == ["/a", "/ws"]
+        assert [h.head.upgrade for h in heads] == [None, "websocket"]

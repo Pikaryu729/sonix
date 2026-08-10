@@ -114,20 +114,23 @@ class QueryParams:
         return len(self._by_name)
 
 
-class Request:
-    def __init__(self, scope: Scope, receive: Receive) -> None:
+class HTTPConnection:
+    """Everything a Request and a WebSocket both have: the scope, read-only.
+
+    Extracted so that dependency injection can resolve path and query
+    parameters for a websocket handler with no special-casing -- app/di.py
+    types its resolution against this, and a WebSocket is one without
+    pretending to have a method or a body. WebSocket lives in
+    app/websockets.py rather than here, so this module stays free of
+    anything connection-lifecycle-shaped.
+    """
+
+    def __init__(self, scope: Scope) -> None:
         self._scope = scope
-        self._receive = receive
-        self._body: bytes | None = None
-        self._stream_consumed = False
 
     @property
     def scope(self) -> Scope:
         return self._scope
-
-    @property
-    def method(self) -> str:
-        return self._scope["method"]
 
     @property
     def path(self) -> str:
@@ -172,6 +175,15 @@ class Request:
         # than a plain __getitem__ lookup.
         return self._scope.get("path_params", {})
 
+    @property
+    def state(self) -> dict[str, Any]:
+        # A shallow copy of whatever the lifespan yielded, put here by the
+        # server. Per-request, so a handler may stash values on it without
+        # leaking them into the next request; the objects the lifespan opened
+        # stay shared. Empty when running without a lifespan, so reading it is
+        # always safe.
+        return self._scope.get("state", {})
+
     @cached_property
     def headers(self) -> Headers:
         return Headers(self._scope["headers"])
@@ -179,6 +191,18 @@ class Request:
     @cached_property
     def query_params(self) -> QueryParams:
         return QueryParams(self._scope["query_string"])
+
+
+class Request(HTTPConnection):
+    def __init__(self, scope: Scope, receive: Receive) -> None:
+        super().__init__(scope)
+        self._receive = receive
+        self._body: bytes | None = None
+        self._stream_consumed = False
+
+    @property
+    def method(self) -> str:
+        return self._scope["method"]
 
     async def stream(self) -> AsyncIterator[bytes]:
         if self._body is not None:
